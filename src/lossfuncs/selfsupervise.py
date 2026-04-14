@@ -37,6 +37,32 @@ TRUNCATED_DIST = 4
 DELTA_T = 0.1  # seconds
 
 
+# ---- Adaptive Consensus MLP (Direction 1) ----------------------------------
+class AdaptiveConsensusMLP(torch.nn.Module):
+    """Lightweight MLP that predicts per-candidate confidence from local context.
+
+    Input features (4-dim, per candidate):
+        0. flow magnitude      (normalized by / 10.0)
+        1. chamfer distance    (normalized by / TRUNCATED_DIST)
+        2. temporal factor     (normalized by / 5.0)
+        3. cluster density     (cluster point count / 512.0)
+    Output: confidence in [0, 1] via Sigmoid.
+    """
+    def __init__(self, in_dim=4, hidden_dim=32):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, hidden_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(hidden_dim, 1),
+            torch.nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
 # ---- helpers -----------------------------------------------------------------
 
 def get_time_delta(frame_id):
@@ -123,7 +149,7 @@ def batched_chamfer_related(res_dict, timer=None):
 # Based on TeFlow paper: https://arxiv.org/abs/2602.19053
 def multi_frames_clusterLoss(
     pc0_list, pc0_lab_list, flow_list,
-    frame_keys, frames_dists, frames_indices, res_dict, args={}
+    frame_keys, frames_dists, frames_indices, res_dict, args={}, adaptive_mlp=None
 ):
     """RANSAC-weighted cluster consistency loss across multiple temporal frames.
 
@@ -145,7 +171,7 @@ def multi_frames_clusterLoss(
             cluster_mask  = (lab0 == label)
             cluster_flows = fv[cluster_mask]
 
-            ext_flows, ext_dists, ext_tw = [], [], []
+            ext_flows, ext_dists, ext_tw, ext_frames = [], [], [], []
             for frame_id in frame_keys:
                 dist_c = frames_dists[frame_id][i][cluster_mask]
                 idx_c  = frames_indices[frame_id][i][cluster_mask]
@@ -160,6 +186,7 @@ def multi_frames_clusterLoss(
                 ext_flows.append(flows)
                 ext_dists.append(topk_dists)
                 ext_tw.append(torch.full((TOP_K,), pow(TIME_DECAY, factor), device=p0.device))
+                ext_frames.append(frame_id)
 
             if not ext_flows:
                 continue
@@ -179,13 +206,41 @@ def multi_frames_clusterLoss(
             cos_sim = torch.nn.functional.cosine_similarity(
                 all_cands[:, None, :], all_cands[None, :, :], dim=-1)
             inlier  = cos_sim > COS_THRESH
-            # Eq. 6
-            weights = torch.cat([all_tw * (1 + d_norm[:-1]),
-                                  (NET_EST_W * (1 + d_norm[-1])).unsqueeze(0)])
+
+            if adaptive_mlp is not None:
+                # ---- Direction 1: Adaptive Temporal Consensus ----
+                # Replace Eq. 6 hardcoded weights with learnable confidence.
+                cluster_density = cluster_mask.sum().float() / 512.0
+                features = []
+                for frame_id, flows, dists in zip(ext_frames, ext_flows, ext_dists):
+                    time_delta, factor = get_time_delta(frame_id)
+                    f_mag = torch.linalg.norm(flows, dim=-1)
+                    feat = torch.stack([
+                        f_mag / 10.0,
+                        dists / TRUNCATED_DIST,
+                        torch.full_like(f_mag, factor / 5.0),
+                        torch.full_like(f_mag, cluster_density),
+                    ], dim=-1)
+                    features.append(feat)
+                # network estimate feature
+                net_feat = torch.tensor([
+                    net_mag / 10.0,
+                    0.0,  # no chamfer distance for network estimate
+                    0.0,  # anchor frame
+                    cluster_density,
+                ], device=p0.device).unsqueeze(0)
+                features.append(net_feat)
+                all_features = torch.cat(features, dim=0)  # (N_cands, 4)
+                weights = adaptive_mlp(all_features)
+            else:
+                # Eq. 6 (original hardcoded)
+                weights = torch.cat([all_tw * (1 + d_norm[:-1]),
+                                      (NET_EST_W * (1 + d_norm[-1])).unsqueeze(0)])
+
             # Eq. 7
             scores  = torch.matmul(inlier.float(), weights.unsqueeze(1)).squeeze()
             best    = torch.argmax(scores)
-            
+
             # Eq. 8
             inlier_flows = all_cands[inlier[best]]
             inlier_w     = weights[inlier[best]]
@@ -295,6 +350,48 @@ def teflowLoss(res_dict, timer=None):
             pc0_list, pc0_lab_list, flow_list,
             frame_keys, frames_dists, frames_indices, res_dict,
             res_dict.get('cluster_loss_args', {}),
+        )
+    else:
+        moved_cluster_loss = torch.tensor(0.0, device=pc0_list[0].device)
+
+    return {
+        'chamfer_dis':          chamfer_dis,
+        'dynamic_chamfer_dis':  dynamic_chamfer_dis,
+        'static_flow_loss':     static_loss,
+        'cluster_based_pc0pc1': moved_cluster_loss,
+    }
+
+# Direction 1: Adaptive Temporal Consensus (adaptive weighting for multi-frame cluster loss)
+def adaptiveTeflowLoss(res_dict, timer=None):
+    """TeFlow with learnable adaptive consensus weights via lightweight MLP."""
+    pc0_list     = res_dict['pc0_list']
+    flow_list    = res_dict['est_flow_list']
+    pc0_lab_list = res_dict['pc0_labels_list']
+
+    chamfer_dis, dynamic_chamfer_dis, frame_keys = batched_chamfer_related(res_dict, timer)
+
+    static_loss = torch.tensor(0.0, device=pc0_list[0].device)
+    for fv, lab in zip(flow_list, pc0_lab_list):
+        if (lab == 0).any():
+            static_loss += torch.linalg.vector_norm(fv[lab == 0], dim=-1).mean()
+    static_loss /= max(len(pc0_list), 1)
+
+    cluster_weight = res_dict['loss_weights_dict'].get('cluster_based_pc0pc1', 0.0)
+    if cluster_weight > 0:
+        frames_dists, frames_indices = {}, {}
+        for frame_id in frame_keys:
+            d_list, i_list = MyCUDAChamferDis.batched_disid_res(
+                pc0_list, res_dict[f'{frame_id}_list'],
+            )
+            frames_dists[frame_id]   = d_list
+            frames_indices[frame_id] = i_list
+
+        cluster_args = res_dict.get('cluster_loss_args', {})
+        moved_cluster_loss = multi_frames_clusterLoss(
+            pc0_list, pc0_lab_list, flow_list,
+            frame_keys, frames_dists, frames_indices, res_dict,
+            cluster_args,
+            adaptive_mlp=cluster_args.get('adaptive_mlp', None),
         )
     else:
         moved_cluster_loss = torch.tensor(0.0, device=pc0_list[0].device)

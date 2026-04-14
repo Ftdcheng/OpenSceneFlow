@@ -506,6 +506,9 @@ class DynamicVoxelizer(nn.Module):
     def _get_point_offsets(self, points: torch.Tensor,
                            voxel_coords: torch.Tensor):
 
+        '''
+        获取点云中的点到这个点所在体素的体素中心坐标的距离
+        '''
         point_cloud_range = torch.tensor(self.point_cloud_range,
                                          dtype=points.dtype,
                                          device=points.device)

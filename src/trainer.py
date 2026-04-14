@@ -25,7 +25,7 @@ import os, sys, time, h5py
 BASE_DIR = os.path.abspath(os.path.join( os.path.dirname( __file__ ), '..' ))
 sys.path.append(BASE_DIR)
 from src.utils import import_func
-from src.lossfuncs import SSL_LOSSES_FN
+from src.lossfuncs import SSL_LOSSES_FN, AdaptiveConsensusMLP
 from src.utils.mics import weights_init, zip_res
 from src.utils.av2_eval import write_output_file
 from src.models.basic import cal_pose0to1, WarmupCosLR
@@ -61,6 +61,10 @@ class ModelWrapper(LightningModule):
         }
         for key, default in default_self_values.items():
             setattr(self, key, cfg.get(key, default))
+
+        if self.loss_fn == 'adaptiveTeflowLoss':
+            self.adaptive_mlp = AdaptiveConsensusMLP(in_dim=4, hidden_dim=32)
+            self.cluster_loss_args['adaptive_mlp'] = self.adaptive_mlp
 
         if ('voxel_size' in cfg.model.target) and ('point_cloud_range' in cfg.model.target) and not eval and 'point_cloud_range' in cfg:
             OmegaConf.set_struct(cfg.model.target, True)
@@ -387,7 +391,8 @@ curl -X POST https://sceneflow.argoverse.org/submissions/upload \\
                 self.train_validation_step_(batch, res_dict)
         except Exception as e:
             print(f"==> Exception occur during training/validation step: {e}. Skip this batch.")
-            print(f"Batch info: scene_id: {batch['scene_id']}, timestamp: {batch['timestamp']}, pc0 size: {batch['pc0']}")
+            ts = batch.get('timestamp', 'N/A')
+            print(f"Batch info: scene_id: {batch.get('scene_id', 'N/A')}, timestamp: {ts}, pc0 size: {batch.get('pc0', 'N/A')}")
     
     def test_step(self, batch, batch_idx):
         batch, res_dict = self.run_model_wo_ground_data(batch)
