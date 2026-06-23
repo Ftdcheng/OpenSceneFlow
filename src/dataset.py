@@ -24,6 +24,7 @@ import h5py, pickle, argparse
 from tqdm import tqdm
 import numpy as np
 from torchvision import transforms
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import os, sys
 BASE_DIR = os.path.abspath(os.path.join( os.path.dirname( __file__ ), '..' ))
@@ -184,36 +185,104 @@ class ToTensor(object):
         return data_dict
 
 class HDF5Dataset(Dataset):
-    def __init__(self, directory, \
-                transform=None, n_frames=2, ssl_label=None, \
-                eval = False, leaderboard_version=1, \
-                vis_name='', index_flow=False):
-        '''
+    """Torch Dataset backed by preprocessed HDF5 files.
+
+    The dataset directory must contain:
+      - ``*.h5`` files, one per scene. Each file is keyed by timestamp strings.
+      - ``index_total.pkl``: a ``List[List[str]]`` where each item is
+        ``[scene_id, timestamp]``. This is the canonical full index.
+      - ``index_eval.pkl`` (optional): same shape as ``index_total.pkl``,
+        subset used for leaderboard evaluation.
+      - ``index_flow.pkl`` (optional): same shape as ``index_total.pkl``,
+        subset containing only frames with GT flow annotations.
+
+    HDF5 file structure (one file per scene, e.g. ``{scene_id}.h5``):
+
+    .. code-block:: text
+
+        {scene_id}.h5
+        └── {timestamp}/                 # Group, one per frame
+            ├── lidar                   # (N, 3) float32, point cloud xyz
+            ├── ground_mask             # (N,) bool, True for ground points
+            ├── pose                    # (4, 4) float32, ego vehicle pose
+            ├── ego_motion              # (4, 4) float32, ego motion transform
+            ├── lidar_dt                # (N,) float32, per-point time delta
+            ├── lidar_id                # (N,) uint8, LiDAR beam/ring id
+            ├── flow                    # (N, 3) float32, GT scene flow (optional)
+            ├── flow_is_valid           # (N,) bool, GT validity mask (optional)
+            ├── flow_category_indices   # (N,) uint8, per-point category (optional)
+            └── flow_instance_id        # (N,) int16, per-point instance id (optional)
+
+    Notes:
+      - ``lidar`` is read as ``f[timestamp]['lidar'][:][:, :3]`` to keep only
+        xyz coordinates even if the stored array has extra channels.
+      - Fields marked ``(optional)`` may be absent depending on the dataset
+        (e.g. test sets usually lack ``flow``; some datasets lack
+        ``flow_category_indices``).
+      - Additional visualization keys can be loaded via ``vis_name``.
+
+    Data layout assumptions (verified for AV2 / nuScenes / demo):
+      1. ``index_total.pkl`` lists frames grouped by ``scene_id``. All frames
+         belonging to the same scene appear consecutively and are sorted by
+         ``timestamp`` in ascending order.
+      2. ``__getitem__`` relies on the next frame being at
+         ``data_index[index_ + 1]`` (``pc1``) and history frames at
+         ``data_index[index_ - i]`` (``pch1``, ``pch2``, ...). Therefore the
+         caller must not request the last frame of a scene or frames too close
+         to the beginning of a scene.
+      3. Eval / train subsets (``index_eval.pkl`` / ``index_flow.pkl``) do NOT
+         contain a separate data copy. They only list ``[scene_id, timestamp]``
+         entries that exist in ``index_total.pkl``; the actual point cloud data
+         is still read from the same ``*.h5`` files in ``directory``.
+    """
+
+    # Type aliases for readability (Python 3.8 compatible)
+    IndexEntry = List[str]                # [scene_id: str, timestamp: str]
+    DataIndex = List[IndexEntry]
+    SceneBounds = Dict[str, Dict[str, Any]]
+
+    def __init__(self,
+                 directory: str,
+                 transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+                 n_frames: int = 2,
+                 ssl_label: Optional[str] = None,
+                 eval: bool = False,
+                 leaderboard_version: int = 1,
+                 vis_name: str = '',
+                 index_flow: bool = False) -> None:
+        """
         Args:
-            directory: the directory of the dataset, the folder should contain some .h5 file and index_total.pkl.
-
-            Following are optional:
-            * transform: for data augmentation, default is None.
-            * n_frames: the number of frames we use, default is 2: current (pc0), next (pc1); if it's more than 2, then it read the history from current.
-            * ssl_label: if attr, it will read the dynamic cluster label. Otherwise, no dynamic cluster label in data dict.
-            * eval: if True, use the eval index (only used it for leaderboard evaluation)
-            * leaderboard_version: 1st or 2nd, default is 1. If '2', we will use the index_eval_v2.pkl from assets/docs.
-            * vis_name: the data of the visualization, default is ''.
-            * index_flow: if True, use the flow index for training or visualization.
-        '''
+            directory: Path to the dataset folder containing ``.h5`` files and
+                ``index_total.pkl``.
+            transform: Optional data-augmentation callable applied to a sample dict.
+            n_frames: Number of frames to load. Default 2 means pc0 (current) and
+                pc1 (next); values >2 also load history frames pch1, pch2, ...
+            ssl_label: Name of the auto-label function in ``src.autolabel`` used
+                to load dynamic cluster labels. ``None`` means no cluster labels.
+            eval: If True, load the eval subset for leaderboard submission.
+            leaderboard_version: 1 or 2; version 2 uses ``index_eval_v2.pkl``.
+            vis_name: Extra HDF5 key(s) to load for visualization.
+            index_flow: If True, use ``index_flow.pkl`` to skip frames without GT flow.
+        """
         super(HDF5Dataset, self).__init__()
-        self.directory = directory
-        if (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or not torch.distributed.is_initialized():
-            print(f"----[Debug] Loading data with num_frames={n_frames}, ssl_label={ssl_label}, eval={eval}, leaderboard_version={leaderboard_version}")
+        self.directory: str = directory
+        if (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) \
+                or not torch.distributed.is_initialized():
+            print(f"----[Debug] Loading data with num_frames={n_frames}, "
+                  f"ssl_label={ssl_label}, eval={eval}, leaderboard_version={leaderboard_version}")
+
+        # Canonical full index: List[[scene_id, timestamp], ...].
         with open(os.path.join(self.directory, 'index_total.pkl'), 'rb') as f:
-            self.data_index = pickle.load(f)
+            self.data_index: HDF5Dataset.DataIndex = pickle.load(f)
 
-        self.eval_index = False
-        self.ssl_label = import_func(f"src.autolabel.{ssl_label}") if ssl_label is not None else None
-        self.history_frames = n_frames - 2
-        self.vis_name = vis_name if isinstance(vis_name, list) else [vis_name]
-        self.transform = transform
+        self.eval_index: bool = False
+        self.ssl_label: Optional[Callable[[h5py.Group], np.ndarray]] = \
+            import_func(f"src.autolabel.{ssl_label}") if ssl_label is not None else None
+        self.history_frames: int = n_frames - 2
+        self.vis_name: List[str] = vis_name if isinstance(vis_name, list) else [vis_name]
+        self.transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = transform
 
+        # Eval index fallback path: eval -> eval_v2 -> flow -> panic.
         if eval:
             eval_index_file = os.path.join(self.directory, 'index_eval.pkl')
             if leaderboard_version == 2:
@@ -225,12 +294,14 @@ class HDF5Dataset(Dataset):
                 eval_index_file = os.path.join(self.directory, 'index_flow.pkl')
                 if not os.path.exists(eval_index_file):
                     raise Exception(f"No any eval index file found! Please check {self.directory}")
-            
+
             self.eval_index = eval
             with open(eval_index_file, 'rb') as f:
-                self.eval_data_index = pickle.load(f)
+                self.eval_data_index: HDF5Dataset.DataIndex = pickle.load(f)
 
-        self.scene_id_bounds = {}  # 存储每个scene_id的最大最小timestamp和位置
+        # Per-scene statistics: maps scene_id -> {min_timestamp, max_timestamp,
+        # min_index, max_index} in the canonical data_index.
+        self.scene_id_bounds: HDF5Dataset.SceneBounds = {}
         for idx, (scene_id, timestamp) in enumerate(self.data_index):
             if scene_id not in self.scene_id_bounds:
                 self.scene_id_bounds[scene_id] = {
@@ -245,35 +316,58 @@ class HDF5Dataset(Dataset):
                 if timestamp > bounds["max_timestamp"]:
                     bounds["max_timestamp"] = timestamp
                     bounds["max_index"] = idx
-        
-        # for some dataset that annotated HZ is different.... like truckscene and nuscene etc.
-        self.train_index = None
-        if (not eval and ssl_label is None and transform is not None) or index_flow: # transform indicates whether we are in training mode.
-            # check if train seq all have gt.
+
+        # Optional training subset used when not every frame has GT flow
+        # (e.g., truckscene or nuscene with different annotation rates).
+        self.train_index: Optional[HDF5Dataset.DataIndex] = None
+        if (not eval and ssl_label is None and transform is not None) or index_flow:
             one_scene_id = list(self.scene_id_bounds.keys())[0]
             check_flow_exist = True
             with h5py.File(os.path.join(self.directory, f'{one_scene_id}.h5'), 'r') as f:
-                for i in range(self.scene_id_bounds[one_scene_id]["min_index"], self.scene_id_bounds[one_scene_id]["max_index"]):
-                        scene_id, timestamp = self.data_index[i]
-                        key = str(timestamp)
-                        if 'flow' not in f[key]:
-                            check_flow_exist = False
-                            break
+                for i in range(self.scene_id_bounds[one_scene_id]["min_index"],
+                               self.scene_id_bounds[one_scene_id]["max_index"]):
+                    scene_id, timestamp = self.data_index[i]
+                    key = str(timestamp)
+                    if 'flow' not in f[key]:
+                        check_flow_exist = False
+                        break
             if not check_flow_exist:
-                print(f"----- [Warning]: Not all frames have flow data, we will instead use the index_flow.pkl to train.")
-                self.train_index = pickle.load(open(os.path.join(self.directory, 'index_flow.pkl'), 'rb'))
+                print("----- [Warning]: Not all frames have flow data, "
+                      "we will instead use the index_flow.pkl to train.")
+                self.train_index = pickle.load(
+                    open(os.path.join(self.directory, 'index_flow.pkl'), 'rb'))
                 
-    def __len__(self):
-        # return 100 # for testing
+    def __len__(self) -> int:
+        """Return the number of samples for the active mode."""
         if self.eval_index:
             return len(self.eval_data_index)
         elif not self.eval_index and self.train_index is not None:
             return len(self.train_index)
         return len(self.data_index)
-    
-    def valid_index(self, index_):
-        """
-        Check if the index is valid for the current mode and satisfy the constraints.
+
+    def valid_index(self, index_: int) -> Tuple[bool, int]:
+        """Map an external sample index to the canonical ``data_index`` position.
+
+        For eval/train subsets, this resolves the subset entry back to its
+        position in ``self.data_index``. For the full index, it clamps the
+        index so that history frames and the next frame are available.
+
+        The clamping / recursion is necessary because ``__getitem__`` reads
+        ``data_index[index_ + 1]`` as the next frame (``pc1``) and
+        ``data_index[index_ - i]`` as history frames (``pch1``, ...). Those
+        offsets are only valid when ``index_`` lies inside the interior of a
+        scene's contiguous block in ``data_index`` (see class docstring).
+
+        In eval/train subset mode, if the requested frame happens to be the
+        last frame of its scene, we recursively fall back to the previous
+        subset entry. This preserves the subset length while avoiding an
+        out-of-bounds access to ``data_index[index_ + 1]``.
+
+        Args:
+            index_: Sample index requested by the DataLoader.
+
+        Returns:
+            Tuple of ``(eval_flag, canonical_index)``.
         """
         eval_flag = False
         if self.eval_index:
@@ -300,9 +394,50 @@ class HDF5Dataset(Dataset):
             min_valid_index_for_flow = min_idx + self.history_frames
             index_ = max(min_valid_index_for_flow, min(max_valid_index_for_flow, index_))
         return eval_flag, index_
-    
-    def __getitem__(self, index_):
-        eval_flag, index_ = self.valid_index(index_)
+
+    def __getitem__(self, index_: int) -> Dict[str, Any]:
+        """Load one sample as a dictionary.
+
+        The returned ``data_dict`` may contain the following fields:
+
+        Core fields (always present):
+          - ``scene_id`` (str): UUID of the scene.
+          - ``timestamp`` (str): Current frame timestamp.
+          - ``eval_flag`` (bool): Whether this sample belongs to an eval subset.
+          - ``pc0`` (np.ndarray, (N, 3)): Current-frame point cloud.
+          - ``gm0`` (np.ndarray, (N,) bool): Ground mask for ``pc0``.
+          - ``pose0`` (np.ndarray, (4, 4)): Ego pose of the current frame.
+
+        Future frame (``history_frames >= -1``, i.e. always when ``n_frames >= 2``):
+          - ``pc1`` (np.ndarray, (M, 3)): Next-frame point cloud.
+          - ``gm1`` (np.ndarray, (M,) bool): Ground mask for ``pc1``.
+          - ``pose1`` (np.ndarray, (4, 4)): Ego pose of the next frame.
+
+        History frames (``history_frames > 0``, i.e. ``n_frames > 2``):
+          - ``pch{i+1}`` (np.ndarray): Point cloud of the i-th past frame.
+          - ``gmh{i+1}`` (np.ndarray): Ground mask of the i-th past frame.
+          - ``poseh{i+1}`` (np.ndarray): Ego pose of the i-th past frame.
+
+        Dynamic cluster labels (only if ``ssl_label`` is provided):
+          - ``pc0_dynamic`` (np.ndarray): Cluster labels for ``pc0``.
+          - ``pc1_dynamic`` (np.ndarray): Cluster labels for ``pc1``.
+          - ``pch1_dynamic`` (np.ndarray): Cluster labels for ``pch1``.
+
+        Optional HDF5 fields (present only when stored in the file):
+          - ``ego_motion`` (np.ndarray, (4, 4)): Precomputed ego-motion transform.
+          - ``lidar_dt`` (float): Time delta between frames.
+          - ``lidar_center`` (np.ndarray): LiDAR sensor center transform(s).
+          - ``flow`` (np.ndarray, (N, 3)): Ground-truth scene flow.
+          - ``flow_is_valid`` (np.ndarray, (N,) bool): Per-point flow validity.
+          - ``flow_category_indices`` (np.ndarray): Per-point category labels.
+          - ``flow_instance_id`` (np.ndarray): Per-point instance IDs.
+          - ``dufo``: DUFO-related dynamic/static labels.
+
+        Eval-only fields (only when ``eval=True``):
+          - ``eval_mask`` (np.ndarray, (N,) bool): Points to include in leaderboard
+            evaluation (ground points removed).
+        """
+        eval_flag, index_ = self.valid_index(index_) # 如果index_不小心在整个场景的前几帧或者最后一帧，偏移index_使得刚好能有历史帧和未来帧
         scene_id, timestamp = self.data_index[index_]
 
         key = str(timestamp)
@@ -313,13 +448,14 @@ class HDF5Dataset(Dataset):
         }
         with h5py.File(os.path.join(self.directory, f'{scene_id}.h5'), 'r') as f:
             # original data
-            data_dict['pc0'] = f[key]['lidar'][:][:,:3]
+            data_dict['pc0'] = f[key]['lidar'][:][:,:3] # 中间的[:]是复制整个(N,3)，这会触发读入内存操作。
             data_dict['gm0'] = f[key]['ground_mask'][:]
             data_dict['pose0'] = f[key]['pose'][:]
             if self.ssl_label is not None:
                 data_dict['pc0_dynamic'] = self.ssl_label(f[key])
 
             if self.history_frames >= 0: 
+                # 未来一帧加载
                 next_timestamp = str(self.data_index[index_ + 1][1])
                 data_dict['pose1'] = f[next_timestamp]['pose'][:]
                 data_dict['pc1'] = f[next_timestamp]['lidar'][:][:,:3]
@@ -327,6 +463,7 @@ class HDF5Dataset(Dataset):
                 if self.ssl_label is not None:
                     data_dict['pc1_dynamic'] = self.ssl_label(f[next_timestamp])
                 
+                # 历史帧加载
                 past_frames = []
                 for i in range(1, self.history_frames + 1):
                     frame_index = index_ - i
