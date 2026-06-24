@@ -25,6 +25,7 @@ from tqdm import tqdm
 import numpy as np
 from torchvision import transforms
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import os, sys
 BASE_DIR = os.path.abspath(os.path.join( os.path.dirname( __file__ ), '..' ))
@@ -39,63 +40,69 @@ def extract_flow_number(key):
 
 # FIXME(Qingwen 2025-08-20): update more pretty here afterward!
 def collate_fn_pad(batch):
+    """将变长点云/flow样本拼成固定形状的batch tensor。
+
+    对batch中每个样本，先按ground_mask去掉地面点，再将同一帧（pc0/pc1/pch*）
+    或同一flow按最大点数padding。点云padding值为NaN，flow和动态标签padding值为0。
+    """
     batch_size_ = len(batch)
-    pcs_after_mask_ground, poses_dict, flows_after_mask_ground = {}, {}, {}
-    
+    pcs_after_mask_ground = defaultdict(list)
+    flows_after_mask_ground = defaultdict(list)
+    poses_dict = defaultdict(list)
+
+    # 点云及flow去地面；位姿直接收集（无需去地面）
     for i in range(batch_size_):
-        single_data = batch[i]
+        single_data = batch[i]  # 单帧点云及其邻近帧
         for key in single_data.keys():
             if key.startswith('pc') and f'gm{key[2:]}' in single_data and not key.endswith("dynamic"):
                 gm_key = f'gm{key[2:]}'
-                if key not in pcs_after_mask_ground:
-                    pcs_after_mask_ground[key] = []
+                # key: pc0, pc1, pch1, pch2, ...; value: 去掉地面后的点云
                 pcs_after_mask_ground[key].append(single_data[key][~single_data[gm_key]])
             elif key.startswith('flow'):
                 id_flow = extract_flow_number(key)
                 gm_key = f'gm{id_flow}'
-                if key not in flows_after_mask_ground:
-                    flows_after_mask_ground[key] = []
                 flows_after_mask_ground[key].append(single_data[key][~single_data[gm_key]])
             elif key.startswith('pose'):
-                if key not in poses_dict:
-                    poses_dict[key] = []
                 poses_dict[key].append(single_data[key])
 
+    # 按batch内最大点数padding；点云用NaN，便于后续用torch.isnan过滤padding
     for key in pcs_after_mask_ground:
-        pcs_after_mask_ground[key] = torch.nn.utils.rnn.pad_sequence(pcs_after_mask_ground[key], batch_first=True, padding_value=torch.nan)
+        pcs_after_mask_ground[key] = torch.nn.utils.rnn.pad_sequence(
+            pcs_after_mask_ground[key], batch_first=True, padding_value=torch.nan
+        )
     for key in flows_after_mask_ground:
-        flows_after_mask_ground[key] = torch.nn.utils.rnn.pad_sequence(flows_after_mask_ground[key], batch_first=True)
+        flows_after_mask_ground[key] = torch.nn.utils.rnn.pad_sequence(
+            flows_after_mask_ground[key], batch_first=True, padding_value=0
+        )
 
-    # Prepare the result dictionary
+    # 把点云、flow GT、位姿汇总进res_dict
     res_dict = {key: pcs_after_mask_ground[key] for key in pcs_after_mask_ground}
-    # ground truth information:
     res_dict.update({key: flows_after_mask_ground[key] for key in flows_after_mask_ground})
     res_dict.update({key: [poses_dict[key][i] for i in range(batch_size_)] for key in poses_dict})
 
-    for flow_key in flows_after_mask_ground:
-        flows_after_mask_ground[flow_key] = torch.nn.utils.rnn.pad_sequence(flows_after_mask_ground[flow_key], batch_first=True, padding_value=0)
-        res_dict[flow_key] = flows_after_mask_ground[flow_key]
-
     if 'ego_motion' in batch[0]:
         res_dict['ego_motion'] = [batch[i]['ego_motion'] for i in range(batch_size_)]
-        
+
     if 'pc0_dynamic' in batch[0]:
-        pc0_dynamic_after_mask_ground, pc1_dynamic_after_mask_ground= [], []
+        pc0_dynamic_after_mask_ground, pc1_dynamic_after_mask_ground = [], []
         for i in range(batch_size_):
             pc0_dynamic_after_mask_ground.append(batch[i]['pc0_dynamic'][~batch[i]['gm0']])
             pc1_dynamic_after_mask_ground.append(batch[i]['pc1_dynamic'][~batch[i]['gm1']])
-        pc0_dynamic_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pc0_dynamic_after_mask_ground, batch_first=True, padding_value=0)
-        pc1_dynamic_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pc1_dynamic_after_mask_ground, batch_first=True, padding_value=0)
-        res_dict['pc0_dynamic'] = pc0_dynamic_after_mask_ground
-        res_dict['pc1_dynamic'] = pc1_dynamic_after_mask_ground
+        res_dict['pc0_dynamic'] = torch.nn.utils.rnn.pad_sequence(
+            pc0_dynamic_after_mask_ground, batch_first=True, padding_value=0
+        )
+        res_dict['pc1_dynamic'] = torch.nn.utils.rnn.pad_sequence(
+            pc1_dynamic_after_mask_ground, batch_first=True, padding_value=0
+        )
     if 'pch1_dynamic' in batch[0]:
-        pch_dynamic_after_mask_ground = [batch[i]['pch1_dynamic'][~batch[i]['gmh1']] for i in range(batch_size_)]
-        pch_dynamic_after_mask_ground = torch.nn.utils.rnn.pad_sequence(pch_dynamic_after_mask_ground, batch_first=True, padding_value=0)
-        res_dict['pch1_dynamic'] = pch_dynamic_after_mask_ground
-    
-    # save the scene_id also...
-    res_dict['scene_id'] = [batch[i]['scene_id'] for i in range(batch_size_)]
+        pch_dynamic_after_mask_ground = [
+            batch[i]['pch1_dynamic'][~batch[i]['gmh1']] for i in range(batch_size_)
+        ]
+        res_dict['pch1_dynamic'] = torch.nn.utils.rnn.pad_sequence(
+            pch_dynamic_after_mask_ground, batch_first=True, padding_value=0
+        )
 
+    res_dict['scene_id'] = [batch[i]['scene_id'] for i in range(batch_size_)]
     return res_dict
 
 # transform, augment
@@ -187,6 +194,14 @@ class ToTensor(object):
 class HDF5Dataset(Dataset):
     """Torch Dataset backed by preprocessed HDF5 files.
 
+    Each sample returned by ``__getitem__`` is centered on one frame (the
+    current frame ``pc0``) and includes its neighboring frames: one future
+    frame (``pc1``) and zero or more history frames (``pch1``, ``pch2``, ...).
+    The total number of frames is controlled by ``n_frames``:
+
+    - ``n_frames=2``: current frame ``pc0`` + next frame ``pc1``.
+    - ``n_frames>2``: current frame + next frame + ``n_frames - 2`` past frames.
+
     The dataset directory must contain:
       - ``*.h5`` files, one per scene. Each file is keyed by timestamp strings.
       - ``index_total.pkl``: a ``List[List[str]]`` where each item is
@@ -201,14 +216,14 @@ class HDF5Dataset(Dataset):
     .. code-block:: text
 
         {scene_id}.h5
-        └── {timestamp}/                 # Group, one per frame
-            ├── lidar                   # (N, 3) float32, point cloud xyz
+        └── {timestamp}/                # Group, one per frame
+            ├── lidar                   # (N, 3) float32, point cloud xyz in sensor (up_lidar) frame
             ├── ground_mask             # (N,) bool, True for ground points
-            ├── pose                    # (4, 4) float32, ego vehicle pose
-            ├── ego_motion              # (4, 4) float32, ego motion transform
+            ├── pose                    # (4, 4) float32, ego -> city transform (city_SE3_ego)
+            ├── ego_motion              # (4, 4) float32, ego0 -> ego1 transform (ego1_SE3_ego0)
             ├── lidar_dt                # (N,) float32, per-point time delta
             ├── lidar_id                # (N,) uint8, LiDAR beam/ring id
-            ├── flow                    # (N, 3) float32, GT scene flow (optional)
+            ├── flow                    # (N, 3) float32, GT scene flow in source ego frame (optional)
             ├── flow_is_valid           # (N,) bool, GT validity mask (optional)
             ├── flow_category_indices   # (N,) uint8, per-point category (optional)
             └── flow_instance_id        # (N,) int16, per-point instance id (optional)
@@ -216,6 +231,10 @@ class HDF5Dataset(Dataset):
     Notes:
       - ``lidar`` is read as ``f[timestamp]['lidar'][:][:, :3]`` to keep only
         xyz coordinates even if the stored array has extra channels.
+      - Coordinate frames follow the AV2 ``dst_SE3_src`` convention:
+        ``lidar`` is in the sensor (up_lidar) frame; ``pose`` transforms points
+        from ego to city; ``ego_motion`` transforms points from ego0 to ego1;
+        ``flow`` is defined in the source ego frame.
       - Fields marked ``(optional)`` may be absent depending on the dataset
         (e.g. test sets usually lack ``flow``; some datasets lack
         ``flow_category_indices``).
@@ -255,8 +274,9 @@ class HDF5Dataset(Dataset):
             directory: Path to the dataset folder containing ``.h5`` files and
                 ``index_total.pkl``.
             transform: Optional data-augmentation callable applied to a sample dict.
-            n_frames: Number of frames to load. Default 2 means pc0 (current) and
-                pc1 (next); values >2 also load history frames pch1, pch2, ...
+            n_frames: Number of frames to load per sample. ``n_frames=2`` loads
+                the current frame (``pc0``) and the next frame (``pc1``); values
+                >2 additionally load past frames (``pch1``, ``pch2``, ...).
             ssl_label: Name of the auto-label function in ``src.autolabel`` used
                 to load dynamic cluster labels. ``None`` means no cluster labels.
             eval: If True, load the eval subset for leaderboard submission.
@@ -345,7 +365,7 @@ class HDF5Dataset(Dataset):
             return len(self.train_index)
         return len(self.data_index)
 
-    def valid_index(self, index_: int) -> Tuple[bool, int]:
+    def valid_index(self, index_: int) -> int:
         """Map an external sample index to the canonical ``data_index`` position.
 
         For eval/train subsets, this resolves the subset entry back to its
@@ -367,24 +387,21 @@ class HDF5Dataset(Dataset):
             index_: Sample index requested by the DataLoader.
 
         Returns:
-            Tuple of ``(eval_flag, canonical_index)``.
+            The corresponding canonical index in ``self.data_index``.
         """
-        eval_flag = False
+        subset_index = None
         if self.eval_index:
-            eval_index_ = index_
-            scene_id, timestamp = self.eval_data_index[eval_index_]
-            index_ = self.data_index.index([scene_id, timestamp])
-            max_idx = self.scene_id_bounds[scene_id]["max_index"]
-            if index_ >= max_idx:
-                _, index_ = self.valid_index(eval_index_ - 1)
-            eval_flag = True
+            subset_index = self.eval_data_index
         elif self.train_index is not None:
-            train_index_ = index_
-            scene_id, timestamp = self.train_index[train_index_]
-            max_idx = self.scene_id_bounds[scene_id]["max_index"]
+            subset_index = self.train_index
+
+        if subset_index is not None:
+            subset_index_ = index_
+            scene_id, timestamp = subset_index[subset_index_]
             index_ = self.data_index.index([scene_id, timestamp])
+            max_idx = self.scene_id_bounds[scene_id]["max_index"]
             if index_ >= max_idx:
-                _, index_ = self.valid_index(train_index_ - 1)
+                index_ = self.valid_index(subset_index_ - 1)
         else:
             scene_id, timestamp = self.data_index[index_]
             max_idx = self.scene_id_bounds[scene_id]["max_index"]
@@ -393,41 +410,53 @@ class HDF5Dataset(Dataset):
             max_valid_index_for_flow = max_idx - 1
             min_valid_index_for_flow = min_idx + self.history_frames
             index_ = max(min_valid_index_for_flow, min(max_valid_index_for_flow, index_))
-        return eval_flag, index_
+        return index_
 
     def __getitem__(self, index_: int) -> Dict[str, Any]:
-        """Load one sample as a dictionary.
+        """Load one sample centered on a single frame.
 
-        The returned ``data_dict`` may contain the following fields:
+        The returned ``data_dict`` contains the current frame ``pc0`` plus its
+        neighboring frames (``pc1`` for the next frame, ``pch{i}`` for history
+        frames) and all associated per-frame information.
 
         Core fields (always present):
           - ``scene_id`` (str): UUID of the scene.
           - ``timestamp`` (str): Current frame timestamp.
           - ``eval_flag`` (bool): Whether this sample belongs to an eval subset.
-          - ``pc0`` (np.ndarray, (N, 3)): Current-frame point cloud.
+          - ``pc0`` (np.ndarray, (N, 3)): Current-frame point cloud in sensor frame.
           - ``gm0`` (np.ndarray, (N,) bool): Ground mask for ``pc0``.
-          - ``pose0`` (np.ndarray, (4, 4)): Ego pose of the current frame.
+          - ``pose0`` (np.ndarray, (4, 4)): Ego pose of the current frame,
+            i.e. ``ego -> city`` transform matrix.
 
         Future frame (``history_frames >= -1``, i.e. always when ``n_frames >= 2``):
-          - ``pc1`` (np.ndarray, (M, 3)): Next-frame point cloud.
+          - ``pc1`` (np.ndarray, (M, 3)): Next-frame point cloud in sensor frame.
           - ``gm1`` (np.ndarray, (M,) bool): Ground mask for ``pc1``.
-          - ``pose1`` (np.ndarray, (4, 4)): Ego pose of the next frame.
+          - ``pose1`` (np.ndarray, (4, 4)): Ego pose of the next frame,
+            i.e. ``ego -> city`` transform matrix.
 
         History frames (``history_frames > 0``, i.e. ``n_frames > 2``):
-          - ``pch{i+1}`` (np.ndarray): Point cloud of the i-th past frame.
+          - ``pch{i+1}`` (np.ndarray): Point cloud of the i-th past frame in sensor frame.
           - ``gmh{i+1}`` (np.ndarray): Ground mask of the i-th past frame.
-          - ``poseh{i+1}`` (np.ndarray): Ego pose of the i-th past frame.
+          - ``poseh{i+1}`` (np.ndarray): Ego pose of the i-th past frame,
+            i.e. ``ego -> city`` transform matrix.
 
         Dynamic cluster labels (only if ``ssl_label`` is provided):
-          - ``pc0_dynamic`` (np.ndarray): Cluster labels for ``pc0``.
-          - ``pc1_dynamic`` (np.ndarray): Cluster labels for ``pc1``.
-          - ``pch1_dynamic`` (np.ndarray): Cluster labels for ``pch1``.
+          - ``pc0_dynamic`` (np.ndarray): SSL cluster labels for ``pc0``.
+              - ``0``: background / static points (including ground).
+              - ``1``: dynamic points without a cluster id (unclustered dynamic).
+              - ``2+``: dynamic cluster instance IDs.
+          - ``pc1_dynamic`` (np.ndarray): SSL cluster labels for ``pc1``,
+            same semantics as ``pc0_dynamic``.
+          - ``pch1_dynamic`` (np.ndarray): SSL cluster labels for ``pch1``,
+            same semantics as ``pc0_dynamic``.
 
         Optional HDF5 fields (present only when stored in the file):
-          - ``ego_motion`` (np.ndarray, (4, 4)): Precomputed ego-motion transform.
+          - ``ego_motion`` (np.ndarray, (4, 4)): Ego-motion transform from the
+            current frame to the next frame, i.e. ``ego0 -> ego1``.
           - ``lidar_dt`` (float): Time delta between frames.
           - ``lidar_center`` (np.ndarray): LiDAR sensor center transform(s).
-          - ``flow`` (np.ndarray, (N, 3)): Ground-truth scene flow.
+          - ``flow`` (np.ndarray, (N, 3)): Ground-truth scene flow, defined in the
+            source ego frame.
           - ``flow_is_valid`` (np.ndarray, (N,) bool): Per-point flow validity.
           - ``flow_category_indices`` (np.ndarray): Per-point category labels.
           - ``flow_instance_id`` (np.ndarray): Per-point instance IDs.
@@ -437,7 +466,8 @@ class HDF5Dataset(Dataset):
           - ``eval_mask`` (np.ndarray, (N,) bool): Points to include in leaderboard
             evaluation (ground points removed).
         """
-        eval_flag, index_ = self.valid_index(index_) # 如果index_不小心在整个场景的前几帧或者最后一帧，偏移index_使得刚好能有历史帧和未来帧
+        index_ = self.valid_index(index_) # 如果index_不小心在整个场景的前几帧或者最后一帧，偏移index_使得刚好能有历史帧和未来帧
+        eval_flag = self.eval_index  # eval模式由构造参数决定，不需要valid_index返回
         scene_id, timestamp = self.data_index[index_]
 
         key = str(timestamp)

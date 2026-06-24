@@ -8,9 +8,17 @@
 # If you find this repo helpful, please cite the respective publication as 
 # listed on the above website.
 # 
-# Description: follow seflow & seflow++ idea but more to run: 
+# Description: follow seflow & seflow++ idea but more to run:
 # (a) dufomap; (b) linefit; (c) hdbscan; (d) nnd.
-# 
+#
+# Default behavior when running `python process.py`:
+#   - fire.Fire(main) generates dufo, ground_mask and cluster labels.
+#   - fire.Fire(run_dufocluster) then generates dufocluster labels.
+#   - overwrite=True means dufo labels are regenerated even if they already exist.
+#   - run_gm=False means existing ground_mask in the HDF5 files is reused.
+#   - scene_range=[0, 1] processes only the first scene (left-closed, right-open).
+#   - interval=1 means no frame skipping when integrating into DUFOMap.
+#
 """
 
 from pathlib import Path
@@ -55,6 +63,28 @@ def run_dufocluster(
     run_gm: bool = False, # run ground segmentation
     min_nnd: float = 0.14, # min nnd distance 1.4m/s pedestrain speed; For Scania data, we set 0.32 here.
 ):
+    """基于已有的 ``dufo`` 动态标签，用 HDBSCAN 对动态点聚类并写入 ``dufocluster``。
+
+    该函数通常在 ``main`` 之后被 ``fire.Fire`` 自动调用。它遍历每个场景，读取
+    每帧的 ``dufo`` 动态点掩码，对动态点运行 HDBSCAN 聚类，将实例级标签写入
+    HDF5 的 ``dufocluster`` 数据集：
+
+    - ``0``：非动态点或未能聚类的点；
+    - 正整数：不同的动态实例聚类 ID。
+
+    默认行为：
+      - ``overwrite=True``：即使已存在 ``dufocluster`` 也会重新生成并覆盖。
+      - 如果某帧缺少 ``dufo`` 标签或动态点少于 20 个，则跳过该帧。
+
+    Args:
+        data_dir: 存放预处理 ``.h5`` 文件的目录。
+        scene_range: 处理的场景索引范围 ``[start, end)``；``[-1, -1]`` 表示全部。
+        interval: 未在本函数中使用，保留以兼容命令行参数。
+        overwrite: 是否强制重新生成 ``dufocluster`` 标签。
+        tag: 地面分割配置标识（本函数中未使用）。
+        run_gm: 是否重新跑地面分割（本函数中未使用）。
+        min_nnd: NND 动态点阈值（本函数中未使用）。
+    """
     data_path = Path(data_dir)
     dataset = HDF5Data(data_path) # single frame reading.
     all_scene_ids = list(dataset.scene_id_bounds.keys())
@@ -114,6 +144,23 @@ def run_nnd(
     run_gm: bool = False, # run ground segmentation
     min_nnd: float = 0.14, # min nnd distance 1.4m/s pedestrain speed; For Scania data, we set 0.32 here.
 ):
+    """使用 CUDA 加速的最近邻距离（NND）生成动态点标签。
+
+    该函数目前未被 ``__main__`` 默认调用（末尾被注释掉）。它通过比较当前帧点云
+    与相邻帧点云在补偿 ego motion 后的 Chamfer 距离，把距离超过 ``min_nnd`` 的
+    点标记为动态。
+
+    需要 GPU 支持。
+
+    Args:
+        data_dir: 存放预处理 ``.h5`` 文件的目录。
+        scene_range: 处理的场景索引范围 ``[start, end)``。
+        interval: 未在本函数中使用，保留以兼容命令行参数。
+        overwrite: 是否强制重新生成 ``nnd`` 标签。
+        tag: 地面分割配置标识（本函数中未使用）。
+        run_gm: 是否重新跑地面分割（本函数中未使用）。
+        min_nnd: 判定为动态点的最小距离阈值（单位：米）。
+    """
     # nnd function
     from assets.cuda.chamfer3D import nnChamferDis
     MyCUDAChamferDis = nnChamferDis()
@@ -182,6 +229,32 @@ def main(
     run_gm: bool = False, # run ground segmentation
     min_nnd: float = 0.14, # min nnd distance 1.4m/s pedestrain speed; For Scania data, we set 0.32 here.
 ):
+    """为每个场景生成 DUFOMap 动态标签、地面掩码和 HDBSCAN 聚类标签。
+
+    默认行为（直接运行 ``python process.py`` 或只改 ``data_dir`` /
+    ``scene_range``）：
+
+    - ``overwrite=True``：即使 HDF5 里已有 ``dufo`` 标签，也会重新生成并覆盖。
+    - ``run_gm=False``：如果 HDF5 里已有 ``ground_mask``，就直接复用，不重新跑
+      地面分割；只有缺失时才会临时初始化 ``ground_seg``。
+    - ``scene_range=[0, 1]``：只处理第 0 个场景（左闭右开）。
+    - ``interval=1``：每一帧都参与 DUFOMap 建图，不跳帧。
+    - ``cluster`` 标签只有在缺失时才会生成，**不受 ``overwrite`` 控制**。
+
+    处理完 ``main`` 后，脚本末尾会继续调用 ``run_dufocluster`` 生成
+    ``dufocluster`` 实例聚类标签。
+
+    Args:
+        data_dir: 存放预处理 ``.h5`` 文件的目录。
+        scene_range: 处理的场景索引范围 ``[start, end)``；``[-1, -1]`` 表示全部场景。
+        interval: DUFOMap 建图时的跳帧间隔，``1`` 表示不跳帧。
+        overwrite: 是否强制重新生成 ``dufo`` 标签并覆盖已有结果。
+        tag: 地面分割配置文件名，会去 ``conf/ground/{tag}.toml`` 读取配置，
+            仅在 ``run_gm=True`` 时生效。
+        run_gm: 是否强制重新运行地面分割。默认 ``False``，即优先使用 HDF5 中
+            已有的 ``ground_mask``。
+        min_nnd: NND 动态标签阈值（仅在 ``run_nnd`` 中使用，``main`` 中未使用）。
+    """
     gm_config_path = f"{BASE_DIR}/conf/ground/{tag}.toml"
     if not os.path.exists(gm_config_path) and run_gm:
         raise FileNotFoundError(f"Ground segmentation config file not found: {gm_config_path}. Please check folder")
@@ -189,13 +262,14 @@ def main(
     data_path = Path(data_dir)
     dataset = HDF5Data(data_path) # single frame reading.
     all_scene_ids = list(dataset.scene_id_bounds.keys())
-    for scene_in_data_index, scene_id in enumerate(all_scene_ids):
+    for scene_in_data_index, scene_id in enumerate(all_scene_ids): # 遍历所有场景
         start_time = time.time()
         # NOTE (Qingwen): so the scene id range is [start, end)
         if scene_range[0]!= -1 and scene_range[-1]!= -1 and (scene_in_data_index < scene_range[0] or scene_in_data_index >= scene_range[1]):
             continue
         bounds = dataset.scene_id_bounds[scene_id]
-        # If you don't want to seflowpp label, then remove cluster: True here. It won't process then.
+        # 检查当前场景的 h5 中是否已经存在三类标签
+        # exist_dict 初始假设全部存在，一旦某帧缺失某个 key 就置为 False
         exist_dict = {"dufo": True, "ground_mask": True, "cluster": True}
         with h5py.File(os.path.join(data_path, f'{scene_id}.h5'), 'r') as f:
             for ii in range(bounds["min_index"], bounds["max_index"]+1):
@@ -205,27 +279,31 @@ def main(
                         exist_dict[datakey] = False
                 if not all(exist_dict.values()):
                     break
-        
+
+        # 如果三类标签全都有，且 overwrite=False，则跳过本场景
         if all(exist_dict.values()) and not overwrite:
             print(f"==> Scene {scene_id} already processed, skip.")
             continue
-        
-        # double check
+
+        # 地面分割：只有缺失 ground_mask 或用户强制 run_gm=True 时才实例化 ground_seg
         if not exist_dict["ground_mask"] or run_gm:
             mygroundseg = ground_seg(gm_config_path)
-        elif not exist_dict["ground_mask"] and not run_gm:
+        elif not exist_dict["ground_mask"] and not run_gm: # 这条分支实际上不可达
             raise ValueError("You set run_gm=False, but ground segmentation is not done. Please check the code.")
-        exist_dict["ground_mask"] = exist_dict["ground_mask"] and not run_gm # and not overwrite # this overwrite is for debug mainly.
-        
+        # run_gm=True 时强制把 exist_dict["ground_mask"] 置为 False，使其重新写入
+        exist_dict["ground_mask"] = exist_dict["ground_mask"] and not run_gm
+
+        # overwrite=True 时强制重新生成 dufo 标签（注意：cluster 不受 overwrite 控制）
         if overwrite:
             exist_dict["dufo"] = False
-        # assign all exist_dict to False, so we can run all the process again.
 
+        # 只有缺失 cluster 标签时才初始化 HDBSCAN
         if 'cluster' in exist_dict and not exist_dict["cluster"]:
             hdbscan_cluster = HDBSCAN(min_cluster_size=20, cluster_selection_epsilon=0.7, alpha=1.1)
         
         # for each scene, we normalize the pose to the first frame to avoid large values.
         ego_pose_norm = dataset[bounds["min_index"]]['pose0']
+        # 如果没有dufo标签，那么开始生成
         if not exist_dict["dufo"]:
             mydufo = dufomap(0.15, 0.2, 1, num_threads=12) # resolution, d_s, d_p, hit_extension
             mydufo.setCluster(0, 20, 0.2) # depth=0, min_points=20, max_dist=0.2
@@ -242,7 +320,7 @@ def main(
                         (norm_pc0>MIN_AXIS_RANGE) & 
                         (norm_pc0<MAX_AXIS_RANGE)
                 )
-                pose0 = npcal_pose0to1(data['pose0'], ego_pose_norm)
+                pose0 = npcal_pose0to1(data['pose0'], ego_pose_norm) # ego_i -> ego_0
                 if 'lidar_center' not in data:
                     # single lidar
                     pose_array = transform_to_array(pose0)

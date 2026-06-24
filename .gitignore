@@ -1,6 +1,8 @@
 
 *.json
 logs/*
+ablations/
+experiments/
 *.pyc
 
 tmp_sbatch.sh

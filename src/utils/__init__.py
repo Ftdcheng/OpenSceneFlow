@@ -26,9 +26,9 @@ def npcal_pose0to1(pose0, pose1):
     otherwise it will be not expected result....
     """
     pose1_inv = np.eye(4, dtype=np.float64)
-    pose1_inv[:3,:3] = pose1[:3,:3].T
+    pose1_inv[:3,:3] = pose1[:3,:3].T # city -> ego
     pose1_inv[:3,3] = (pose1[:3,:3].T * -pose1[:3,3]).sum(axis=1)
-    pose_0to1 = pose1_inv @ pose0.astype(np.float64)
+    pose_0to1 = pose1_inv @ pose0.astype(np.float64) # ego0 -> ego1 (ego0 -> city -> ego1)
     return pose_0to1.astype(np.float32)
 
 
