@@ -16,10 +16,11 @@ import numpy as np
 import torch
 import torch.optim as optim
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from lightning import LightningModule
 from hydra.utils import instantiate
-from omegaconf import OmegaConf, open_dict
+from omegaconf import open_dict
 
 import os, sys, time, h5py
 BASE_DIR = os.path.abspath(os.path.join( os.path.dirname( __file__ ), '..' ))
@@ -40,41 +41,36 @@ class ModelWrapper(LightningModule):
     def __init__(self, cfg, eval=False):
         super().__init__()
 
-        default_self_values = {
-            "batch_size": 1,
-            "lr": 2e-4,
-            "epochs": 3,
-            "loss_fn": 'deflowLoss',
-            "add_seloss": None,
-            "checkpoint": None,
-            "leaderboard_version": 2,
-            "supervised_flag": True,
-            "save_res": False,
-            "res_name": "default",
-            "num_frames": 2,
+        # 从 Hydra 配置中直接读取训练相关参数；默认值统一维护在 conf/config.yaml 中，
+        # 不再在代码里硬编码，避免配置与代码中的默认值不一致。
+        self.batch_size:          int                        = cfg.batch_size          # 每步训练的 batch 大小
+        self.epochs:              int                        = cfg.epochs              # 训练总 epoch 数
+        self.loss_fn_name:        str                        = cfg.loss_fn             # 损失函数名，如 deflowLoss / teflowLoss
+        self.add_seloss:          Optional[Dict[str, float]] = cfg.add_seloss          # 自监督 loss 各项权重，None 表示不使用
+        self.checkpoint:          Optional[str]              = cfg.checkpoint          # checkpoint 路径，用于打印/恢复
+        self.leaderboard_version: int                        = cfg.leaderboard_version # 评估提交格式版本（1/2/3）
+        self.supervised_flag:     bool                       = cfg.supervised_flag     # 是否使用数据集标签（True=有监督/半监督）
+        self.save_res:            bool                       = cfg.save_res            # 是否把预测结果写回 HDF5
+        self.res_name:            str                        = cfg.res_name            # 写入 HDF5 的结果数据集名称
+        self.num_frames:          int                        = cfg.num_frames          # 每个样本加载的帧数（当前 + 未来 + 历史）
+        self.optimizer:           Dict[str, Any]             = cfg.optimizer           # 优化器与学习率调度配置
+        self.dataset_path:        Optional[str]              = cfg.dataset_path        # 数据集根目录，保存结果时使用
+        self.data_mode:           str                        = cfg.data_mode           # 运行模式：train / val / valid / test
+        self.cluster_loss_args:   Dict[str, Any]             = cfg.cluster_loss_args   # teflow cluster loss 的额外参数
 
-            # lr scheduler, only active when warmup_epochs > 0
-            "optimizer": None,
-            "dataset_path": None,
-            "data_mode": None,
-            "cluster_loss_args": {},
-        }
-        for key, default in default_self_values.items():
-            setattr(self, key, cfg.get(key, default))
-
-        if ('voxel_size' in cfg.model.target) and ('point_cloud_range' in cfg.model.target) and not eval and 'point_cloud_range' in cfg:
-            OmegaConf.set_struct(cfg.model.target, True)
+        # 向config填充体素大小
+        # 使用 cfg.model.target 里的 voxel_size / point_cloud_range 计算 grid_feature_size。
+        # 训练时这两个值通过 Hydra 插值来自顶层配置；评估时 cfg.model 已从 checkpoint
+        # 的 hyper_parameters 更新，因此使用 target 层级的值可保证与训练时一致。
+        if 'voxel_size' in cfg.model.target and 'point_cloud_range' in cfg.model.target:
             with open_dict(cfg.model.target):
-                cfg.model.target['grid_feature_size'] = \
-                    [abs(int((cfg.point_cloud_range[0] - cfg.point_cloud_range[3]) / cfg.voxel_size[0])),
-                    abs(int((cfg.point_cloud_range[1] - cfg.point_cloud_range[4]) / cfg.voxel_size[1])),
-                    abs(int((cfg.point_cloud_range[2] - cfg.point_cloud_range[5]) / cfg.voxel_size[2]))]
-        else:
-            with open_dict(cfg.model.target):
-                cfg.model.target['grid_feature_size'] = \
-                    [abs(int((cfg.model.target.point_cloud_range[0] - cfg.model.target.point_cloud_range[3]) / cfg.model.target.voxel_size[0])),
-                    abs(int((cfg.model.target.point_cloud_range[1] - cfg.model.target.point_cloud_range[4]) / cfg.model.target.voxel_size[1])),
-                    abs(int((cfg.model.target.point_cloud_range[2] - cfg.model.target.point_cloud_range[5]) / cfg.model.target.voxel_size[2]))]
+                pc_range = cfg.model.target.point_cloud_range
+                voxel_size = cfg.model.target.voxel_size
+                cfg.model.target['grid_feature_size'] = [
+                    abs(int((pc_range[0] - pc_range[3]) / voxel_size[0])),
+                    abs(int((pc_range[1] - pc_range[4]) / voxel_size[1])),
+                    abs(int((pc_range[2] - pc_range[5]) / voxel_size[2])),
+                ]
         
         # ---> model
         self.point_cloud_range = cfg.model.target.point_cloud_range
@@ -85,8 +81,8 @@ class ModelWrapper(LightningModule):
         # print(f"Model: {self.model.__class__.__name__}, Number of Frames: {self.num_frames}")
 
         # ---> loss fn
-        self.loss_fn = import_func("src.lossfuncs."+cfg.loss_fn) if 'loss_fn' in cfg else None
-        self.cfg_loss_name = cfg.get("loss_fn", None)
+        self.loss_fn = import_func("src.lossfuncs." + self.loss_fn_name) if self.loss_fn_name is not None else None
+        self.cfg_loss_name = self.loss_fn_name
         
         # ---> evaluation metric
         self.metrics = OfficialMetrics()
@@ -221,13 +217,13 @@ class ModelWrapper(LightningModule):
     def train_validation_step_(self, batch, res_dict):
         # means there are ground truth flow so we can evaluate the EPE-3 Way metric
         if batch['flow'][0].shape[0] > 0:
-            pose_flows = res_dict['pose_flow']
+            pose_flows = res_dict['pose_flow'] # 进入模型会进行预处理，对点云进行坐标系变换，这里使用一下处理结果
             for batch_id, gt_flow in enumerate(batch["flow"]):
                 valid_from_pc2res = res_dict['pc0_valid_point_idxes'][batch_id]
                 pose_flow = pose_flows[batch_id][valid_from_pc2res]
 
                 final_flow_ = pose_flow.clone() + res_dict['flow'][batch_id]
-                v1_dict= evaluate_leaderboard(final_flow_, pose_flow, batch['pc0'][batch_id][valid_from_pc2res], gt_flow[valid_from_pc2res], \
+                v1_dict = evaluate_leaderboard(final_flow_, pose_flow, batch['pc0'][batch_id][valid_from_pc2res], gt_flow[valid_from_pc2res], \
                                            batch['flow_is_valid'][batch_id][valid_from_pc2res], batch['flow_category_indices'][batch_id][valid_from_pc2res])
                 v2_dict = evaluate_leaderboard_v2(final_flow_, pose_flow, batch['pc0'][batch_id][valid_from_pc2res], gt_flow[valid_from_pc2res], \
                                         batch['flow_is_valid'][batch_id][valid_from_pc2res], batch['flow_category_indices'][batch_id][valid_from_pc2res])
@@ -309,26 +305,53 @@ curl -X POST https://sceneflow.argoverse.org/submissions/upload \\
             print(f"Enjoy! ^v^ ------ \n")
         
     def eval_only_step_(self, batch, res_dict):
+        """Compute final scene flow and optionally evaluate / save results.
+
+        This function is called for val/test samples (i.e. when ground has been
+        removed in ``run_model_wo_ground_data``). It reconstructs the full-frame
+        scene flow as ``pose_flow + predicted_residual_flow`` and then:
+
+        1. In ``val`` / ``valid`` mode:
+           - Computes leaderboard metrics (v1, v2, ssf) on ``eval_mask`` points.
+           - If ``self.save_res`` is True, writes ``final_flow`` back into the
+             HDF5 file under ``{scene_id}.h5/{timestamp}/{self.res_name}``.
+
+        2. In ``test`` mode:
+           - If ``self.save_res`` is True, writes the submission file for the
+             online leaderboard.
+
+        Args:
+            batch: Dict containing at least ``origin_pc0``, ``gm0``, ``pose0``,
+                ``pose1``, ``eval_mask``, ``scene_id``, ``timestamp`` and, in
+                val/valid mode, GT ``flow`` / ``flow_is_valid`` /
+                ``flow_category_indices``.
+            res_dict: Model forward outputs. May contain ``flow`` (residual flow
+                on non-ground points) and ``pc0_valid_point_idxes`` (indices of
+                points the model actually processed).
+        """
         eval_mask = batch['eval_mask'].squeeze()
         pc0 = batch['origin_pc0']
         pose_0to1 = cal_pose0to1(batch["pose0"], batch["pose1"])
         transform_pc0 = pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
         pose_flow = transform_pc0 - pc0
 
+        # Reconstruct full-frame scene flow:
+        #   final_flow = ego_motion_flow + model_predicted_residual_flow
+        # Ground points keep the rigid ego-motion flow; non-ground points add
+        # the network's residual prediction.
         final_flow = pose_flow.clone()
         if 'pc0_valid_point_idxes' in res_dict:
+            # Model produced flow only for a subset of non-ground points.
             valid_from_pc2res = res_dict['pc0_valid_point_idxes']
-
-            # flow in the original pc0 coordinate
             pred_flow = pose_flow[~batch['gm0']].clone()
-            # debug: for ego-motion flow only
-            # res_dict['flow'] = torch.zeros_like(res_dict['flow'])
             pred_flow[valid_from_pc2res] = res_dict['flow'] + pose_flow[~batch['gm0']][valid_from_pc2res]
             final_flow[~batch['gm0']] = pred_flow
         else:
+            # Model produced flow for all non-ground points.
             final_flow[~batch['gm0']] = res_dict['flow'] + pose_flow[~batch['gm0']]
 
-        if self.data_mode in ['val', 'valid']: # since only val we have ground truth flow to eval
+        # Val / valid mode: compute metrics and optionally save predictions to HDF5.
+        if self.data_mode in ['val', 'valid']:
             gt_flow = batch["flow"]
             v1_dict = evaluate_leaderboard(final_flow[eval_mask], pose_flow[eval_mask], pc0[eval_mask], \
                                        gt_flow[eval_mask], batch['flow_is_valid'][eval_mask], \
@@ -339,8 +362,8 @@ curl -X POST https://sceneflow.argoverse.org/submissions/upload \\
                                     gt_flow[eval_mask], batch['flow_is_valid'][eval_mask], batch['flow_category_indices'][eval_mask])
             
             self.metrics.step(v1_dict, v2_dict, ssf_dict)
+            # Optionally persist the full-frame prediction back to the HDF5 file.
             if self.save_res:
-                # write final_flow into the dataset.
                 key = str(batch['timestamp'])
                 scene_id = batch['scene_id']
                 with h5py.File(os.path.join(self.dataset_path, f'{self.data_mode}/{scene_id}.h5'), 'r+') as f:
@@ -348,17 +371,20 @@ curl -X POST https://sceneflow.argoverse.org/submissions/upload \\
                         del f[key][self.res_name]
                     f[key].create_dataset(self.res_name, data=final_flow.cpu().detach().numpy().astype(np.float32))
 
-        # NOTE (Qingwen): Since val and test, we will force set batch_size = 1 
-        if self.save_res and self.data_mode == 'test': # test must save data to submit in the online leaderboard.    
+        # Test mode: optionally write the leaderboard submission file.
+        # batch_size is forced to 1 for val/test, so each sample is written independently.
+        if self.save_res and self.data_mode == 'test':
             save_pred_flow = final_flow[eval_mask, :3].cpu().detach().numpy()
             rigid_flow = pose_flow[eval_mask, :3].cpu().detach().numpy()
             is_dynamic = np.linalg.norm(save_pred_flow - rigid_flow, axis=1, ord=2) >= 0.05
             sweep_uuid = (batch['scene_id'], batch['timestamp'])
             if self.leaderboard_version in [2, 3]:
-                save_pred_flow = (final_flow - pose_flow).cpu().detach().numpy() # all points here... since 2rd version we need to save the relative flow.
+                # Leaderboard v2/v3 expects the residual flow (without ego motion).
+                save_pred_flow = (final_flow - pose_flow).cpu().detach().numpy()
             write_output_file(save_pred_flow, is_dynamic, sweep_uuid, self.save_res_path, leaderboard_version=self.leaderboard_version)
 
     def run_model_wo_ground_data(self, batch):
+        # 除去地面
         # NOTE (Qingwen): only needed when val or test mode, since train we will go through collate_fn to remove.
         batch['origin_pc0'] = batch['pc0'].clone()
         batch['pc0'] = batch['pc0'][~batch['gm0']].unsqueeze(0)
@@ -367,6 +393,7 @@ curl -X POST https://sceneflow.argoverse.org/submissions/upload \\
         for i in range(1, self.num_frames-1):
             batch[f'pch{i}'] = batch[f'pch{i}'][~batch[f'gmh{i}']].unsqueeze(0)
 
+        # 前向推理
         self.model.timer[12].start("One Scan")
         res_dict = self.model(batch)
         self.model.timer[12].stop()

@@ -14,9 +14,21 @@ val_data: /home/kin/data/av2/h5py/demo/val
 
 output: ${model.name}-${slurm_id}
 
-checkpoint: 
-pretrained_weights: 
-eval_only: False
+checkpoint: null
+pretrained_weights: null
+eval_only: false
+
+# -----> Run mode and I/O
+data_mode: train
+dataset_path: null
+save_res: false
+res_name: default
+leaderboard_version: 2
+supervised_flag: true
+
+# -----> Optional SSL / auxiliary loss settings
+add_seloss: null
+cluster_loss_args: {}
 
 # trainer
 num_workers: 8

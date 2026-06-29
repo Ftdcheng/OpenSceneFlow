@@ -10,6 +10,40 @@
 # Description: Output the evaluation results, go for local evaluation or online evaluation
 """
 
+# -----------------------------------------------------------------------------
+# NOTE: Dataset index files and eval_mask semantics
+# -----------------------------------------------------------------------------
+# This project uses HDF5 files organized as one file per scene. Evaluation
+# subsets are selected via pickle index files rather than by copying data.
+#
+# File layout under cfg.dataset_path / cfg.data_mode:
+#   {scene_id}.h5          -- one file per scene, keyed by timestamp strings
+#   index_total.pkl        -- List[List[str]]: canonical list of ALL frames
+#                             each entry is [scene_id, timestamp]
+#   index_eval.pkl         -- List[Tuple[str, str]]: EVAL subset of frames
+#                             each entry is (scene_id, timestamp)
+#                             NOTE: same shape semantics as index_total.pkl,
+#                             but stored as tuples in this dataset.
+#
+# Important facts (verified against multidata-sf-challenge/test):
+#   - index_eval.pkl entries are FRAMES, not scenes.
+#   - Example: 9613 entries in index_eval.pkl covering 458 scenes.
+#   - index_total.pkl is also a frame-level index (93547 entries), not a
+#     scene-level metadata container.
+#   - index_eval.pkl / index_total.pkl do NOT store eval_mask.
+#
+# eval_mask source and shape:
+#   - eval_mask is read from the HDF5 group f["{timestamp}"]["eval_mask"]
+#     when it exists, otherwise it falls back to ~ground_mask, or finally
+#     to all-ones.
+#   - It is a per-frame, 1-D boolean mask of shape (N,), where N is the
+#     number of points in the current lidar frame.
+#   - It selects which non-ground points participate in leaderboard metrics.
+#
+# See src/dataset.py (HDF5Dataset.__getitem__) for the loading logic and
+# src/trainer.py (ModelWrapper.eval_only_step_) for usage.
+# -----------------------------------------------------------------------------
+
 import torch
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl

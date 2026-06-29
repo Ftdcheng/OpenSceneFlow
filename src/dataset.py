@@ -515,6 +515,7 @@ class HDF5Dataset(Dataset):
                     data_dict[f'gmh{i+1}'] = past_gm
                     data_dict[f'poseh{i+1}'] = past_pose
 
+            # 可视化相关字段加载放入data_dict里
             for data_key in self.vis_name + ['ego_motion', 'lidar_dt', 'lidar_center',
                              # ground truth information:
                              'flow', 'flow_is_valid', 'flow_category_indices', 'flow_instance_id', 'dufo']:
@@ -523,14 +524,15 @@ class HDF5Dataset(Dataset):
 
             if self.eval_index:
                 # looks like v2 not follow the same rule as v1 with eval_mask provided
+                # 如果h5文件里就有eval_mask
                 if 'eval_mask' in f[key]:
                     raw_eval = f[key]['eval_mask'][:]
                     raw_ground = f[key]['ground_mask'][:]
                     # NOTE(Qingwen): performance might be changed for av2 since some eval_mask provided by av2 didn't remove ground points.
-                    data_dict['eval_mask'] = (raw_eval.reshape(-1).astype(bool) & (~raw_ground.reshape(-1).astype(bool)))
-                elif 'ground_mask' in f[key]:
+                    data_dict['eval_mask'] = (raw_eval.reshape(-1).astype(bool) & (~raw_ground.reshape(-1).astype(bool))) # 非地面点中的eval点
+                elif 'ground_mask' in f[key]: # 没有eval mask就用groud mask凑合一下
                     data_dict['eval_mask'] = ~f[key]['ground_mask'][:]
-                else:
+                else: # 连ground mask也没有就全部设为eval mask
                     data_dict['eval_mask'] = np.ones_like(data_dict['pc0'][:, 0], dtype=np.bool_)
                     
         if self.transform:
