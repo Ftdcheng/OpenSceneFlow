@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from torch.optim.lr_scheduler import _LRScheduler
+from typing import Dict, List, Tuple
 
 class BaseModel(nn.Module):
     def __init__(self):
@@ -29,12 +30,66 @@ def cal_pose0to1(pose0: torch.Tensor, pose1: torch.Tensor):
     pose_0to1 = pose1_inv @ pose0.type(torch.float64)
     return pose_0to1.type(torch.float32)
 
-def wrap_batch_pcs(batch, num_frames=2):
+def wrap_batch_pcs(batch: Dict[str, torch.Tensor], num_frames: int = 2) -> Dict[str, torch.Tensor]:
+    """Warp current and past point clouds into the next-frame coordinate system.
+
+    For each sample in the batch, this function:
+      1. Computes the ego-motion transform ``ego0 -> ego1`` (either from
+         ``batch['ego_motion']`` or from ``pose0`` / ``pose1``).
+      2. Warps ``pc0`` (the current frame) into the next-frame coordinate system
+         to obtain ``transform_pc0``.
+      3. Computes ``pose_flow = transform_pc0 - pc0``, i.e. the rigid ego-motion
+         displacement field for every point in ``pc0``.
+      4. When ``num_frames > 2``, also warps each history frame ``pch{i}`` into
+         the next-frame coordinate system.
+
+    Args:
+        batch: A dictionary produced by the DataLoader / collate function. It
+            must contain the following keys:
+
+            - ``pc0`` (Tensor): Current-frame point cloud, shape ``(B, N0, 3)``.
+            - ``pc1`` (Tensor): Next-frame point cloud, shape ``(B, N1, 3)``.
+            - ``pose0`` (Tensor or list): Current-frame ego pose, shape
+              ``(B, 4, 4)``. Each pose is ``ego -> city``.
+            - ``pose1`` (Tensor or list): Next-frame ego pose, shape
+              ``(B, 4, 4)``.
+            - ``ego_motion`` (Tensor or list, optional): Pre-computed transform
+              ``ego0 -> ego1``, shape ``(B, 4, 4)``. If provided, ``pose0`` /
+              ``pose1`` are not used for the current-to-next transform.
+            - ``pch{i}`` (Tensor, optional): i-th history-frame point cloud,
+              shape ``(B, Ni, 3)``. Required when ``num_frames > 2``.
+            - ``poseh{i}`` (Tensor or list, optional): i-th history-frame ego
+              pose, shape ``(B, 4, 4)``. Required when ``num_frames > 2``.
+
+            Here ``B`` is batch size, ``N0`` / ``N1`` / ``Ni`` are the numbers of
+            points in the corresponding frames (usually equal after padding).
+
+        num_frames: Total number of frames per sample. ``num_frames=2`` means
+            only ``pc0`` and ``pc1``; larger values additionally include history
+            frames ``pch1``, ``pch2``, ...
+
+    Returns:
+        A dictionary with the warped point clouds:
+
+        - ``pc0s`` (Tensor): Current frame warped to next-frame coordinates,
+          shape ``(B, N0, 3)``.
+        - ``pc1s`` (Tensor): Next frame, unchanged, shape ``(B, N1, 3)``.
+        - ``pose_flows`` (List[Tensor]): Per-sample ego-motion flow. The list
+          has length ``B``; each element has shape ``(N0, 3)``.
+        - ``pch{i}s`` (Tensor, optional): i-th history frame warped to
+          next-frame coordinates, shape ``(B, Ni, 3)``. Present only when
+          ``num_frames > 2``.
+
+    Note:
+        ``pose_flows`` is returned as a list rather than a single stacked tensor
+        because downstream loss computation indexes each sample with potentially
+        different valid-point subsets (``pc0_valid_point_idxes``).
+    """
     batch_sizes = len(batch["pose0"])
 
-    pose_flows = []
-    transform_pc0s = []
-    transform_pc_m_frames = [[] for _ in range(num_frames - 2)]
+    pose_flows = [] # ego运动
+    transform_pc0s = [] # 所有ego0 -> ego1变换后的点云
+    transform_pc_m_frames = [[] for _ in range(num_frames - 2)] # (pch_idx, batch_idx) -> 转换到未来帧坐标系的点云
     # print(batch)
     for batch_id in range(batch_sizes):
         selected_pc0 = batch["pc0"][batch_id] 
@@ -54,6 +109,7 @@ def wrap_batch_pcs(batch, num_frames=2):
         pose_flows.append(transform_pc0 - selected_pc0)
         transform_pc0s.append(transform_pc0)
 
+        # 所有过去帧转到未来帧坐标系
         for i in range(1, num_frames - 1):
             selected_pc_m = batch[f"pch{i}"][batch_id]
             transform_pc_m = selected_pc_m @ past_poses[i-1][:3, :3].T + past_poses[i-1][:3, 3]

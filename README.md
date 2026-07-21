@@ -141,6 +141,13 @@ And free yourself from trainning, you can download the pretrained weight from [*
 conda activate opensf
 ```
 
+All leaderboard training recipes are provided as Hydra experiment configs under [`conf/experiment/`](conf/experiment/). This keeps commands short and avoids copy-paste errors. You can still override data paths or individual hyper-parameters on the command line, e.g.:
+
+```bash
+python train.py experiment=deltaflow_leaderboard \
+  train_data=/your/path/train val_data=/your/path/val
+```
+
 ### Supervised Training
 
 #### DeltaFlow
@@ -149,9 +156,7 @@ Train DeltaFlow with the leaderboard submit config. [Runtime: Around 18 hours in
 
 ```bash
 # total bz then it's 10x2 under above training setup.
-python train.py model=deltaflow optimizer.lr=2e-3 epochs=20 batch_size=2 num_frames=5 \
-  loss_fn=deflowLoss train_aug=True "voxel_size=[0.15, 0.15, 0.15]" "point_cloud_range=[-38.4, -38.4, -3, 38.4, 38.4, 3]" \
-  optimizer.lr=2e-4 +optimizer.scheduler.name=WarmupCosLR +optimizer.scheduler.max_lr=2e-3 +optimizer.scheduler.warmup_epochs=2
+python train.py experiment=deltaflow_leaderboard
 
 # Pretrained weight can be downloaded through (av2), check all other datasets in the same folder.
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/deltaflow/deltaflow-av2.ckpt
@@ -162,7 +167,7 @@ wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/deltaflow/delta
 Train Flow4D with the leaderboard submit config. [Runtime: Around 18 hours in 4x RTX 3090 GPUs.]
 
 ```bash
-python train.py model=flow4d optimizer.lr=1e-3 epochs=15 batch_size=8 num_frames=5 loss_fn=deflowLoss "voxel_size=[0.2, 0.2, 0.2]" "point_cloud_range=[-51.2, -51.2, -3.2, 51.2, 51.2, 3.2]"
+python train.py experiment=flow4d_leaderboard
 
 # Pretrained weight can be downloaded through:
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/flow4d_best.ckpt
@@ -179,7 +184,7 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu117.html
 Train SSF with the leaderboard submit config. [Runtime: Around 6 hours in 8x A100 GPUs.]
 
 ```bash
-python train.py model=ssf optimizer.lr=8e-3 epochs=25 batch_size=64 loss_fn=deflowLoss "voxel_size=[0.2, 0.2, 6]" "point_cloud_range=[-51.2, -51.2, -3, 51.2, 51.2, 3]"
+python train.py experiment=ssf_leaderboard
 ```
 
 Pretrained weight can be downloaded through:
@@ -196,7 +201,7 @@ wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/ssf_long.ckpt
 Train DeFlow with the leaderboard submit config. [Runtime: Around 6-8 hours in 4x A100 GPUs.] Please change `batch_size&lr` accoordingly if you don't have enough GPU memory. (e.g. `batch_size=6` for 24GB GPU)
 
 ```bash
-python train.py model=deflow optimizer.lr=2e-4 epochs=15 batch_size=16 loss_fn=deflowLoss
+python train.py experiment=deflow_leaderboard
 
 # Pretrained weight can be downloaded through:
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/deflow_best.ckpt
@@ -212,10 +217,7 @@ Train Feed-forward SSL methods (e.g. SeFlow/SeFlow++/VoteFlow etc), we needed to
 
 ```bash
 # [Runtime: Around 20 hours in 10x3080Ti GPUs.]
-python train.py model=deltaflow epochs=15 batch_size=2 num_frames=5 train_aug=True \
-  loss_fn=teflowLoss "voxel_size=[0.15, 0.15, 0.15]" "point_cloud_range=[-38.4, -38.4, -3, 38.4, 38.4, 3]" \
-  +ssl_label=seflow_auto "+add_seloss={chamfer_dis: 1.0, static_flow_loss: 1.0, dynamic_chamfer_dis: 1.0, cluster_based_pc0pc1: 1.0}" \
-  optimizer.name=Adam optimizer.lr=2e-3 +optimizer.scheduler.name=StepLR +optimizer.scheduler.step_size=9 +optimizer.scheduler.gamma=0.5
+python train.py experiment=teflow_leaderboard
 
 # Pretrained weight can be downloaded through (av2), check all other datasets in the same folder.
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/teflow/teflow-av2.ckpt
@@ -225,7 +227,7 @@ wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/teflow/teflow-a
 
 ```bash
 # [Runtime: Around 11 hours in 4x A100 GPUs.]
-python train.py model=deflow optimizer.lr=2e-4 epochs=9 batch_size=16 loss_fn=seflowLoss +ssl_label=seflow_auto "+add_seloss={chamfer_dis: 1.0, static_flow_loss: 1.0, dynamic_chamfer_dis: 1.0, cluster_based_pc0pc1: 1.0}" "model.target.num_iters=2"
+python train.py experiment=seflow_leaderboard
 
 # Pretrained weight can be downloaded through:
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/seflow_best.ckpt
@@ -245,7 +247,7 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu117.html
 
 Train VoteFlow with the leaderboard submit config. [Runtime: Around 32 hours in 4 x V100 GPUs.]
 ```bash
-python train.py model=voteflow optimizer.lr=2e-4 +optimizer.scheduler.name=StepLR +optimizer.scheduler.step_size=6 epochs=12 batch_size=4 model.target.m=8 model.target.n=128 loss_fn=seflowLoss "+add_seloss={chamfer_dis: 1.0, static_flow_loss: 1.0, dynamic_chamfer_dis: 1.0, cluster_based_pc0pc1: 1.0}" +ssl_label=seflow_auto
+python train.py experiment=voteflow_leaderboard
 
 # Pretrained weight can be downloaded through:
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/voteflow_best.ckpt
@@ -256,7 +258,7 @@ wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/voteflow_best.c
 
 ```bash
 # [Runtime: Around 10 hours in 4x A100 GPUs.] for Argoverse 2
-python train.py model=deflowpp save_top_model=3 val_every=3 voxel_size="[0.2, 0.2, 6]" point_cloud_range="[-51.2, -51.2, -3, 51.2, 51.2, 3]" num_workers=16 epochs=9 optimizer.lr=2e-4 +optimizer.scheduler.name=StepLR "+add_seloss={chamfer_dis: 1.0, static_flow_loss: 1.0, dynamic_chamfer_dis: 1.0, cluster_based_pc0pc1: 1.0}" +ssl_label=seflowpp_auto loss_fn=seflowppLoss num_frames=3 batch_size=4
+python train.py experiment=seflowpp_leaderboard
 
 # Pretrained weight can be downloaded through:
 wget https://huggingface.co/kin-zhang/OpenSceneFlow/resolve/main/seflowpp_best.ckpt

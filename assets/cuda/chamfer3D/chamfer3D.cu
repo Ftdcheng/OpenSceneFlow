@@ -96,6 +96,7 @@ int chamfer_cuda_forward(const at::Tensor &pc0, const at::Tensor &pc1, at::Tenso
 	dim3 blocks_pc1(col_blocks_pc1);
 	dim3 threads(THREADS_PER_BLOCK);
 	
+    // 计算pc0各点到pc1各点的距离，求出对于每个pc0点而言，pc1中距离最小的点以及它在pc1中的距离
 	NmDistanceKernel<<<blocks_pc0, threads, 0, stream>>>(pc0_n, pc0.data_ptr<float>(), pc1_n, pc1.data_ptr<float>(), dist0.data_ptr<float>(), idx0.data_ptr<int>());
 	NmDistanceKernel<<<blocks_pc1, threads, 0, stream>>>(pc1_n, pc1.data_ptr<float>(), pc0_n, pc0.data_ptr<float>(), dist1.data_ptr<float>(), idx1.data_ptr<int>());
 	

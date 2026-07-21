@@ -2,6 +2,8 @@
 defaults:
   - hydra: default
   - model: deflow
+  - _self_
+  - experiment: base
   
 slurm_id: 00000
 

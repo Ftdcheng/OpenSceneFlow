@@ -81,19 +81,31 @@ dynamic_scatter = _DynamicScatter.apply
 
 
 class DynamicScatter(nn.Module):
-    """Scatters points into voxels, used in the voxel encoder with dynamic
-    voxelization.
+    """Group points by voxel coordinates and reduce each group to a voxel feature.
+
+    This is the aggregation step of **dynamic voxelization**. Unlike hard
+    voxelization, which pre-allocates a dense voxel grid and pads empty voxels,
+    ``DynamicScatter`` only produces features for voxels that actually contain
+    points: it collects all points sharing the same voxel coordinate, then
+    reduces their features with ``'max'`` or ``'mean'``.
+
+    Typical usage:
+
+    - ``cluster_scatter`` in pillar/voxel encoders: compute the mean point
+      position inside each voxel.
+    - ``pfn_scatter`` after a point feature network: aggregate per-point
+      encoded features into per-voxel features.
 
     Note:
         The CPU and GPU implementation get the same output, but have numerical
         difference after summation and division (e.g., 5e-7).
 
     Args:
-        voxel_size (list): list [x, y, z] size of three dimension.
-        point_cloud_range (list): The coordinate range of points, [x_min,
-            y_min, z_min, x_max, y_max, z_max].
+        voxel_size (list): list [x, y, z] size of three dimension, shape ``(3,)``.
+        point_cloud_range (list): The coordinate range of points, ``[x_min,
+            y_min, z_min, x_max, y_max, z_max]``, shape ``(6,)``.
         average_points (bool): whether to use avg pooling to scatter points
-            into voxel.
+            into voxel. ``True`` selects ``'mean'`` reduction, otherwise ``'max'``.
     """
 
     def __init__(self, voxel_size: List, point_cloud_range: List,
@@ -110,15 +122,19 @@ class DynamicScatter(nn.Module):
         """Scatters points into voxels.
 
         Args:
-            points (torch.Tensor): Points to be reduced into voxels.
+            points (torch.Tensor): Points/features to be reduced into voxels,
+                shape ``(N, C)``. ``C`` can be any feature dimension, e.g. raw
+                point channels or already-encoded features from upstream layers.
             coors (torch.Tensor): Corresponding voxel coordinates (specifically
-                multi-dim voxel index) of each points.
+                multi-dim voxel index) of each points, shape ``(N, ndim)``.
 
         Returns:
             tuple[torch.Tensor]: A tuple contains two elements. The first one
-            is the voxel features with shape [M, C] which are respectively
+            is the voxel features with shape ``(M, C)`` which are respectively
             reduced from input features that share the same voxel coordinates.
-            The second is voxel coordinates with shape [M, ndim].
+            The second is voxel coordinates with shape ``(M, ndim)``. ``M`` is
+            the number of unique voxels among the ``N`` input points, so
+            ``M <= N``.
         """
         reduce = 'mean' if self.average_points else 'max'
         return dynamic_scatter(points.contiguous(), coors.contiguous(), reduce)
@@ -127,16 +143,26 @@ class DynamicScatter(nn.Module):
                 coors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatters points/features into voxels.
 
+        Supports single-frame (``coors`` without batch dimension) and batched
+        (``coors`` with leading batch index) inputs.
+
         Args:
-            points (torch.Tensor): Points to be reduced into voxels.
-            coors (torch.Tensor): Corresponding voxel coordinates (specifically
-                multi-dim voxel index) of each points.
+            points (torch.Tensor): Points/features to be reduced into voxels,
+                shape ``(N, C)``. ``C`` can be any feature dimension, e.g. raw
+                point channels or encoded features from upstream layers.
+            coors (torch.Tensor): Corresponding voxel coordinates of each point.
+                If ``coors.size(-1) == ndim``, shape is ``(N, ndim)`` and no
+                batch dimension is expected. Otherwise, the first column is
+                the batch index and shape is ``(N, ndim + 1)``.
 
         Returns:
             tuple[torch.Tensor]: A tuple contains two elements. The first one
-            is the voxel features with shape [M, C] which are respectively
-            reduced from input features that share the same voxel coordinates.
-            The second is voxel coordinates with shape [M, ndim].
+            is the voxel features with shape ``(M, C)`` reduced from input
+            features that share the same voxel coordinates. The second is voxel
+            coordinates with shape ``(M, ndim)`` for the single-frame case, or
+            ``(M, ndim + 1)`` for the batched case, where the first column is
+            the batch index. ``M`` is the number of unique voxels among the
+            ``N`` input points, so ``M <= N``.
         """
         if coors.size(-1) == 3:
             return self.forward_single(points, coors)

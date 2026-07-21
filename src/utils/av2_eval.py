@@ -469,19 +469,48 @@ def compute_metrics(
 ) -> Dict[str, List[Any]]:
     """Compute all the metrics for a given example and package them into a list to be put into a DataFrame.
 
+    The function first breaks the point cloud into 8 subsets by
+    ``Class`` (Background / Foreground), ``Motion`` (Dynamic / Static) and
+    ``Distance`` (Close / Far). For each subset it computes average scene-flow
+    metrics and dynamic-segmentation counts. These per-subset values are stored
+    in an internal ``results`` dict, which is then aggregated into the four
+    leaderboard v1 metrics returned to the caller.
+
     Args:
-        pred_flow: (N,3) Predicted flow vectors.
+        pred_flow: (N,3) Predicted flow vectors in meters.
         pred_dynamic: (N,) Predicted dynamic labels.
-        gts: (N,3) Ground truth flow vectors.
+        gts: (N,3) Ground truth flow vectors in meters.
         category_indices: (N,) Integer class labels for each point.
         is_dynamic: (N,) Ground truth dynamic labels.
         is_close: (N,) True for a point if it is within a 70m x 70m box around the AV.
         is_valid: (N,) True for a point if its flow vector was successfully computed.
-        metric_categories: A dictionary mapping segmentation labels to groups of category indices.
 
     Returns:
-        A dictionary of columns to create a long-form DataFrame of the results from.
-        One row for each subset in the breakdown.
+        dict: A dictionary with four leaderboard v1 metrics:
+
+            - ``EPE_BS`` (float): Background Static EPE, averaged over indices
+              ``[2, 3]`` of the internal ``results`` table.
+            - ``EPE_FD`` (float): Foreground Dynamic EPE, averaged over indices
+              ``[4, 5]``.
+            - ``EPE_FS`` (float): Foreground Static EPE, averaged over indices
+              ``[6, 7]``.
+            - ``IoU`` (float): Dynamic segmentation IoU across all points.
+
+        The internal ``results`` dict used during aggregation has the following
+        keys (one entry per subset, 8 entries total):
+
+            - ``Class`` (List[str]): ``'Background'`` or ``'Foreground'``.
+            - ``Motion`` (List[str]): ``'Dynamic'`` or ``'Static'``.
+            - ``Distance`` (List[str]): ``'Close'`` or ``'Far'``.
+            - ``Count`` (List[int]): Number of valid points in the subset.
+            - Scene-flow metrics from ``SceneFlowMetricType``:
+              ``ACCURACY_RELAX``, ``ACCURACY_STRICT``, ``ANGLE_ERROR``, ``EPE``.
+            - Segmentation counts from ``SegmentationMetricType``:
+              ``TP``, ``TN``, ``FP``, ``FN``.
+
+        Indices ``[0, 1]`` are Background Dynamic (Close/Far); ``[2, 3]`` are
+        Background Static; ``[4, 5]`` are Foreground Dynamic; ``[6, 7]`` are
+        Foreground Static.
     """
     metric_categories = FOREGROUND_BACKGROUND_BREAKDOWN
     pred_flow = pred_flow[is_valid].astype(np.float64)

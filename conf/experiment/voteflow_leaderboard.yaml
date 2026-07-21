@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - override /model: voteflow
+
+epochs: 12
+batch_size: 4
+loss_fn: seflowLoss
+
+ssl_label: seflow_auto
+
+add_seloss:
+  chamfer_dis: 1.0
+  static_flow_loss: 1.0
+  dynamic_chamfer_dis: 1.0
+  cluster_based_pc0pc1: 1.0
+
+model:
+  target:
+    m: 8
+    n: 128
+
+optimizer:
+  lr: 2e-4
+  scheduler:
+    name: StepLR
+    step_size: 6

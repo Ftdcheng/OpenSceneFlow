@@ -29,13 +29,40 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 
 
 class ChamferDis(Function):
-    """Single-sample Chamfer distance: pc0 (N,3) × pc1 (M,3) on GPU."""
+    """Single-sample Chamfer distance (autograd Function).
+
+    For two point clouds ``pc0`` and ``pc1``, computes the nearest-neighbor
+    distances in both directions:
+
+    - ``dis0[i] = min_j ||pc0[i] - pc1[j]||``
+    - ``dis1[j] = min_i ||pc1[j] - pc0[i]||``
+
+    Args:
+        pc0 (torch.Tensor): Source points, shape ``(N, 3)``.
+        pc1 (torch.Tensor): Target points, shape ``(M, 3)``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        - ``dis0`` (Tensor): Per-point distances from ``pc0`` to ``pc1``,
+          shape ``(N,)``.
+        - ``dis1`` (Tensor): Per-point distances from ``pc1`` to ``pc0``,
+          shape ``(M,)``.
+        - ``idx0`` (Tensor): Indices of nearest neighbors in ``pc1`` for each
+          ``pc0`` point, shape ``(N,)``, values in ``[0, M-1]``.
+        - ``idx1`` (Tensor): Indices of nearest neighbors in ``pc0`` for each
+          ``pc1`` point, shape ``(M,)``, values in ``[0, N-1]``.
+    """
 
     @staticmethod
     def forward(ctx, pc0, pc1):
+        # pc0 各点到 pc1 各点的最短距离，[N,]
         dis0 = torch.zeros(pc0.shape[0], device=pc0.device).contiguous()
+        # pc1 各点到 pc0 各点的最短距离，[M,]
         dis1 = torch.zeros(pc1.shape[0], device=pc1.device).contiguous()
+        # pc0 各点到 pc1 各点的最短距离id，[N,]
         idx0 = torch.zeros(pc0.shape[0], dtype=torch.int32, device=pc0.device).contiguous()
+        # pc1 各点到 pc0 各点的最短距离id，[N,]
         idx1 = torch.zeros(pc1.shape[0], dtype=torch.int32, device=pc1.device).contiguous()
         chamfer3D.forward(pc0, pc1, dis0, dis1, idx0, idx1)
         ctx.save_for_backward(pc0, pc1, idx0, idx1)
@@ -43,6 +70,17 @@ class ChamferDis(Function):
 
     @staticmethod
     def backward(ctx, gd0, gd1, _gi0, _gi1):
+        """Compute gradients w.r.t. pc0 and pc1.
+
+        Args:
+            gd0 (torch.Tensor): Gradient w.r.t. ``dis0``, shape ``(N,)``.
+            gd1 (torch.Tensor): Gradient w.r.t. ``dis1``, shape ``(M,)``.
+            _gi0, _gi1: Gradients w.r.t. indices (unused, indices are not differentiable).
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: Gradients ``gpc0`` (``(N, 3)``)
+            and ``gpc1`` (``(M, 3)``).
+        """
         pc0, pc1, idx0, idx1 = ctx.saved_tensors
         gpc0 = torch.zeros_like(pc0)
         gpc1 = torch.zeros_like(pc1)
@@ -52,17 +90,31 @@ class ChamferDis(Function):
 
 # ─── nn.Module ────────────────────────────────────────────────────────────────
 class nnChamferDis(nn.Module):
-    """Chamfer distance loss — single and batched-via-streams modes.
+    """Chamfer distance layer with optional truncation and CUDA-stream batching.
+
+    This module wraps ``ChamferDis`` for use in loss functions. It supports:
+
+    - Single tensor inputs: ``pc0`` (``N, 3``) and ``pc1`` (``M, 3``).
+    - List-of-tensors inputs: ``[pc0_0, ..., pc0_{B-1}]`` and
+      ``[pc1_0, ..., pc1_{B-1}]``, processed in parallel via CUDA streams.
+      Each list element can have its own point count.
 
     Methods
     -------
-    forward(pc0, pc1)
-        Single-sample or list-of-samples loss. Used by seflowLoss / seflowppLoss.
-        If a list is provided, it processes it in parallel via CUDA streams.
+    forward(input0, input1, truncate_dist=-1)
+        Single-sample or batched Chamfer loss. Returns a scalar Tensor.
 
-    dis_res(pc0, pc1)        → (dist0, dist1), no reduction
-    disid_res(pc0, pc1)      → (dist0, dist1, idx0, idx1), no reduction
-    truncated_dis(pc0, pc1)  → NSFP-style truncated loss
+    batched_disid_res(pc0_list, pc1_list)
+        Batched nearest-neighbor distances and indices, list-in/list-out.
+
+    dis_res(pc0, pc1)
+        Raw (dist0, dist1) without reduction.
+
+    disid_res(pc0, pc1)
+        Raw (dist0, dist1, idx0, idx1) without reduction.
+
+    truncated_dis(pc0, pc1, truncate_dist=2.0)
+        NSFP-style truncated Chamfer loss (outliers clamped to 0).
     """
 
     def __init__(self, truncate_dist: bool = True):
@@ -79,7 +131,28 @@ class nnChamferDis(nn.Module):
     # ── forward ─────────────────────────────────────────────────
 
     def forward(self, input0, input1, truncate_dist: float = -1, **_ignored) -> torch.Tensor:
-        """Chamfer loss. Supports single tensor or list of tensors."""
+        """Compute Chamfer distance loss.
+
+        Supports a single pair of tensors or a pair of lists (batched via
+        CUDA streams).
+
+        Args:
+            input0 (Tensor or list[Tensor]): Source point cloud(s). If a single
+                tensor, shape ``(N, 3)``. If a list, length ``B``; element ``i``
+                has shape ``(N_i, 3)``.
+            input1 (Tensor or list[Tensor]): Target point cloud(s). If a single
+                tensor, shape ``(M, 3)``. If a list, length ``B``; element ``i``
+                has shape ``(M_i, 3)``.
+            truncate_dist (float, optional): If positive, distances larger than
+                this threshold are ignored when computing the mean (uses
+                ``nanmean`` over inliers). Default ``-1`` means no truncation.
+            **_ignored: Ignored keyword arguments for API compatibility.
+
+        Returns:
+            torch.Tensor: Scalar Chamfer loss. For a single pair it is
+            ``mean(dist0) + mean(dist1)``; for lists it is the mean of this
+            quantity across all samples.
+        """
         if not isinstance(input0, list):
             dist0, dist1, _, _ = ChamferDis.apply(input0.contiguous(), input1.contiguous())
             if truncate_dist <= 0:
@@ -118,18 +191,32 @@ class nnChamferDis(nn.Module):
                           pc0_list: List[torch.Tensor],
                           pc1_list: List[torch.Tensor],
                           ) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Parallel disid_res across B samples via CUDA streams.
+        """Parallel nearest-neighbor query across B samples via CUDA streams.
 
-        Same list-in / list-out convention as batched().
+        For each sample i, returns per-point nearest-neighbor distances and
+        LOCAL indices from ``pc0_list[i]`` into ``pc1_list[i]``.
 
-        Returns
-        -------
-        dist0_list : List[(N_i,)]  per-point nearest distance in pc1_i
-        idx0_list  : List[(N_i,)]  LOCAL index into pc1_list[i]  (0 .. M_i-1)
+        Args:
+            pc0_list (list[Tensor]): Length ``B``; ``pc0_list[i]`` has shape
+                ``(N_i, 3)``.
+            pc1_list (list[Tensor]): Length ``B``; ``pc1_list[i]`` has shape
+                ``(M_i, 3)``.
 
-        Usage:
-            dist0_list, idx0_list = fn.batched_disid_res(pc0_list, pc1_list)
-            neighbour = pc1_list[i][idx0_list[i][mask]]   # no global arithmetic
+        Returns:
+            tuple[list[Tensor], list[Tensor]]:
+
+            - ``dist0_list``: Length ``B``; ``dist0_list[i]`` has shape
+              ``(N_i,)``. ``dist0_list[i][n]`` is the distance from
+              ``pc0_list[i][n]`` to its nearest neighbor in ``pc1_list[i]``.
+            - ``idx0_list``: Length ``B``; ``idx0_list[i]`` has shape
+              ``(N_i,)``. ``idx0_list[i][n]`` is the local index in
+              ``pc1_list[i]`` of that nearest neighbor, i.e. values are in
+              ``[0, M_i - 1]``.
+
+        Example:
+            >>> dist0_list, idx0_list = fn.batched_disid_res(pc0_list, pc1_list)
+            >>> # Neighbor of pc0_list[i][mask] in pc1_list[i]:
+            >>> neighbour = pc1_list[i][idx0_list[i][mask]]
         """
         B = len(pc0_list)
         if B == 1:
@@ -157,17 +244,59 @@ class nnChamferDis(nn.Module):
     # ── utilities ─────────────────────────────────────────────────────────────
 
     def dis_res(self, input0: torch.Tensor, input1: torch.Tensor):
-        """Return raw (dist0, dist1) without reduction."""
+        """Return raw nearest-neighbor distances without reduction.
+
+        Args:
+            input0 (Tensor): Source points, shape ``(N, 3)``.
+            input1 (Tensor): Target points, shape ``(M, 3)``.
+
+        Returns:
+            tuple[Tensor, Tensor]:
+
+            - ``dist0`` (Tensor): shape ``(N,)``, distances from ``input0`` to
+              ``input1``.
+            - ``dist1`` (Tensor): shape ``(M,)``, distances from ``input1`` to
+              ``input0``.
+        """
         d0, d1, _, _ = ChamferDis.apply(input0.contiguous(), input1.contiguous())
         return d0, d1
 
     def disid_res(self, input0: torch.Tensor, input1: torch.Tensor):
-        """Return raw (dist0, dist1, idx0, idx1) without reduction."""
+        """Return raw nearest-neighbor distances and indices without reduction.
+
+        Args:
+            input0 (Tensor): Source points, shape ``(N, 3)``.
+            input1 (Tensor): Target points, shape ``(M, 3)``.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor, Tensor]:
+
+            - ``dist0`` (Tensor): shape ``(N,)``.
+            - ``dist1`` (Tensor): shape ``(M,)``.
+            - ``idx0`` (Tensor): shape ``(N,)``, nearest-neighbor indices into
+              ``input1``.
+            - ``idx1`` (Tensor): shape ``(M,)``, nearest-neighbor indices into
+              ``input0``.
+        """
         return ChamferDis.apply(input0.contiguous(), input1.contiguous())
 
     def truncated_dis(self, input0: torch.Tensor, input1: torch.Tensor,
                       truncate_dist: float = 2.0) -> torch.Tensor:
-        """NSFP-style: distances >= threshold clamped to 0, then mean."""
+        """NSFP-style truncated Chamfer loss.
+
+        Distances larger than ``truncate_dist`` are clamped to 0 before taking
+        the mean. This is different from ``forward(..., truncate_dist > 0)``,
+        which ignores outliers via ``nanmean``.
+
+        Args:
+            input0 (Tensor): Source points, shape ``(N, 3)``.
+            input1 (Tensor): Target points, shape ``(M, 3)``.
+            truncate_dist (float, optional): Threshold in meters. Default ``2.0``.
+
+        Returns:
+            torch.Tensor: Scalar loss, ``mean(dist0) + mean(dist1)`` after
+            clamping outliers to 0.
+        """
         cx, cy = self.dis_res(input0, input1)
         cx[cx >= truncate_dist] = 0.0
         cy[cy >= truncate_dist] = 0.0

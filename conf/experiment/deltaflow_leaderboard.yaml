@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - override /model: deltaflow
+
+epochs: 20
+batch_size: 2
+num_frames: 5
+train_aug: true
+loss_fn: deflowLoss
+
+voxel_size: [0.15, 0.15, 0.15]
+point_cloud_range: [-38.4, -38.4, -3, 38.4, 38.4, 3]
+
+optimizer:
+  # README command had both optimizer.lr=2e-3 and optimizer.lr=2e-4;
+  # the later override wins in Hydra CLI, so we keep 2e-4 here.
+  lr: 2e-4
+  scheduler:
+    name: WarmupCosLR
+    max_lr: 2e-3
+    warmup_epochs: 2

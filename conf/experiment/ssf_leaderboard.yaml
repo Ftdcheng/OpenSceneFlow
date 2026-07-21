@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - override /model: ssf
+
+epochs: 25
+batch_size: 64
+loss_fn: deflowLoss
+
+voxel_size: [0.2, 0.2, 6]
+point_cloud_range: [-51.2, -51.2, -3, 51.2, 51.2, 3]

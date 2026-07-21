@@ -105,10 +105,8 @@ class ModelWrapper(LightningModule):
         """
         total_loss, bz_ = 0.0, len(batch["pose0"])
 
-        pc0_list = [res_dict['pc0_points_lst'][i] for i in range(bz_)]
-
         dict2loss = {
-            'pc0_list':         pc0_list,
+            'pc0_list':         [res_dict['pc0_points_lst'][i] for i in range(bz_)],
             'est_flow_list':    [res_dict['flow'][i] for i in range(bz_)],
             'pc0_labels_list':  [batch['pc0_dynamic'][i][res_dict['pc0_valid_point_idxes'][i]] for i in range(bz_)],
             'batch_size':       bz_,
