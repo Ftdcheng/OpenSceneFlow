@@ -32,3 +32,7 @@ dist*
 data
 *.pcd
 *__pycache__
+
+# visual config
+.polyscope.ini
+imgui.ini

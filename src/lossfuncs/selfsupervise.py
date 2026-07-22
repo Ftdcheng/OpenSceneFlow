@@ -3,7 +3,8 @@ Self-supervised loss function entry points.
 
 This module exposes:
 
-- ``teflowLoss``: multi-frame TeFlow loss (chamfer + static + cluster RANSAC/rigid).
+- ``teflowLoss``: original multi-frame TeFlow loss (chamfer + static + RANSAC cluster loss).
+- ``reflowLoss``: ReFlow loss (TeFlow + straight-line vs rigid/Kabsch cluster model selection).
 - ``seflowppLoss``: bidirectional SeFlow++ loss.
 - ``seflowLoss``: single-frame SeFlow loss.
 
@@ -18,13 +19,17 @@ _MyCUDAChamferDis = nnChamferDis()
 
 from ._teflow_chamfer import batched_chamfer_related as _batched_chamfer_related
 from ._teflow_chamfer import TRUNCATED_DIST as _TRUNCATED_DIST
-from ._teflow_cluster import multi_frames_clusterLoss as _multi_frames_cluster_loss
+from ._teflow_cluster_baseline import multi_frames_clusterLoss as _multi_frames_cluster_loss
+from ._teflow_cluster import multi_frames_clusterLoss_reflow as _multi_frames_cluster_loss_reflow
 from ._seflow_cluster import _seflow_cluster_loop
 
 
-# from paper: https://arxiv.org/abs/2602.19053
-def teflowLoss(res_dict, timer=None):
-    """Temporal seflow: chamfer over all frames + static + RANSAC/rigid cluster loss."""
+def _teflow_loss_impl(res_dict, timer, cluster_loss_fn):
+    """Shared implementation for ``teflowLoss`` and ``reflowLoss``.
+
+    The two losses differ only in the cluster-consistency function used to
+    produce ``cluster_based_pc0pc1``.
+    """
     pc0_list     = res_dict['pc0_list']
     flow_list    = res_dict['est_flow_list']
     pc0_lab_list = res_dict['pc0_labels_list']
@@ -47,7 +52,7 @@ def teflowLoss(res_dict, timer=None):
             frames_dists[frame_id]   = d_list
             frames_indices[frame_id] = i_list
 
-        moved_cluster_loss = _multi_frames_cluster_loss(
+        moved_cluster_loss = cluster_loss_fn(
             pc0_list, pc0_lab_list, flow_list,
             frame_keys, frames_dists, frames_indices, res_dict,
             res_dict.get('cluster_loss_args', {}),
@@ -61,6 +66,17 @@ def teflowLoss(res_dict, timer=None):
         'static_flow_loss':     static_loss,
         'cluster_based_pc0pc1': moved_cluster_loss,
     }
+
+
+# from paper: https://arxiv.org/abs/2602.19053
+def teflowLoss(res_dict, timer=None):
+    """Original multi-frame TeFlow loss (chamfer + static + RANSAC cluster loss)."""
+    return _teflow_loss_impl(res_dict, timer, _multi_frames_cluster_loss)
+
+
+def reflowLoss(res_dict, timer=None):
+    """ReFlow loss: TeFlow with straight-line vs rigid/Kabsch cluster model selection."""
+    return _teflow_loss_impl(res_dict, timer, _multi_frames_cluster_loss_reflow)
 
 
 # from paper: https://arxiv.org/abs/2503.00803

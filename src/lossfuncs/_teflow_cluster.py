@@ -329,19 +329,20 @@ def _rigid_cluster_target_flow(
     return target_flow, True
 
 
-# ---- multi-frame cluster loss (teflow) -------------------
+# ---- multi-frame cluster loss (ReFlow) -------------------
 # Based on TeFlow paper: https://arxiv.org/abs/2602.19053
-def multi_frames_clusterLoss(
+def multi_frames_clusterLoss_reflow(
     pc0_list, pc0_lab_list, flow_list,
     frame_keys, frames_dists, frames_indices, res_dict, args={}
 ):
-    """RANSAC-weighted cluster consistency loss across multiple temporal frames (TeFlow Eq. 2-9).
+    """RANSAC + rigid/Kabsch cluster consistency loss across multiple temporal frames (ReFlow).
 
     For every dynamic cluster (label > 1) in every sample of the batch, this
-    function gathers ``top_k_candidates`` nearest-neighbor flow hypotheses from
-    each auxiliary frame, combines them with the network's own average estimate,
-    and selects a consensus target flow via weighted RANSAC voting. The final
-    loss has a point-level MSE term plus a cluster-level mean-residual term.
+    function first decides whether the cluster is undergoing approximate
+    straight-line uniform motion.  If so, it falls back to the original TeFlow
+    RANSAC voting.  Otherwise it matches the cluster to auxiliary-frame clusters
+    and estimates a rigid SE(3) transform via Kabsch.  The final loss has a
+    point-level MSE term plus a cluster-level mean-residual term.
 
     Args:
         pc0_list (list[Tensor]): Source point clouds, length ``B``.
